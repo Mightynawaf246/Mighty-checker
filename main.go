@@ -43,6 +43,7 @@ type config struct {
 	keepList      bool
 	noConfirm     bool
 	noAdapt       bool
+	http2         bool
 }
 
 // liveStats holds counters written by workers and read by the status line, so
@@ -246,7 +247,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	cache := newClientCacheFor(cfg.timeout, cfg.threads)
+	cache := newClientCacheFor(cfg.timeout, cfg.threads).withHTTP2(cfg.http2)
 	defer cache.closeIdle()
 
 	// One limiter for the whole run, shared across rounds, so what a round
@@ -386,6 +387,11 @@ func printConfig(cfg *config, usernames []string, pool *proxyPool) {
 	} else {
 		row("Adaptive", cGreen(fmt.Sprintf("on (up to %d, tuned to the endpoint)", cfg.threads)))
 	}
+	if cfg.http2 {
+		row("Protocol", cYellow("HTTP/2 (one connection per host - caps concurrency)"))
+	} else {
+		row("Protocol", cGreen("HTTP/1.1 (one connection per request - full concurrency)"))
+	}
 	if cfg.webhook != "" {
 		row("Webhook", cGreen("on"))
 	}
@@ -506,7 +512,7 @@ func runPipeline(ctx context.Context, usernames []string, pool *proxyPool,
 	writerDone := make(chan tally, 1)
 	go func() {
 		writerDone <- runWriter(results, cfg, con, sink, stats, pool, lim,
-			round, len(usernames), start, prior)
+			round, len(usernames), workers, start, prior)
 	}()
 
 	wg.Wait()
@@ -616,10 +622,17 @@ func attemptOnce(ctx context.Context, username string, pool *proxyPool,
 		pool.markOK(p)
 		lim.onClean()
 	default:
-		// Unknown is what a soft block looks like. Treat it as back-pressure and
-		// hold it against the proxy, so a blocked proxy is rotated out.
+		// An unknown answer nearly always means this one proxy is soft blocked,
+		// not that the endpoint is asking everybody to slow down. The quarantine
+		// already handles that by rotating the proxy out, and the retry lands on
+		// a fresh one. Cutting global concurrency here too would punish the
+		// whole run for one bad proxy — with a large pool that collapses the
+		// cap to the floor and never recovers. Only an explicit 429/5xx speaks
+		// for the endpoint as a whole, so only that throttles.
 		pool.markFail(p)
-		lim.onThrottle()
+		if out.retryable {
+			lim.onThrottle()
+		}
 	}
 	return out
 }
@@ -730,9 +743,21 @@ func outcomeResult(username string, o attemptOutcome, cfg *config) result {
 
 // ----------------------------------------------------------------------- writer
 
+// effectiveConcurrency is how many checks can really be in flight: the adaptive
+// cap, or the worker count when that is lower. Workers are capped at the number
+// of names left, so a list that has shrunk to a handful is itself the ceiling —
+// showing the adaptive cap alone would claim a parallelism that cannot exist.
+func effectiveConcurrency(lim *adaptiveLimiter, workers int) int {
+	n := workers
+	if c := lim.current(); c > 0 && c < n {
+		n = c
+	}
+	return n
+}
+
 func runWriter(results <-chan result, cfg *config, con *console, sink *resultSink,
 	stats *liveStats, pool *proxyPool, lim *adaptiveLimiter,
-	round, total int, start time.Time, prior tally) tally {
+	round, total, workers int, start time.Time, prior tally) tally {
 
 	var counts tally
 
@@ -746,25 +771,23 @@ func runWriter(results <-chan result, cfg *config, con *console, sink *resultSin
 
 	record := sink.record
 
-	// Instantaneous RPS/UPS over a rolling window between refreshes.
-	lastTick := time.Now()
-	var lastAttempts int64
-	var lastChecked int
+	// RPS/UPS are averaged over a trailing window rather than over the gap
+	// between two refreshes. attempts is cumulative across rounds, so the
+	// baseline is seeded from its current value: starting from zero would make
+	// the first tick of every round report the whole run as one burst.
+	rpsWin := newRateWindow(3 * time.Second)
+	upsWin := newRateWindow(3 * time.Second)
+	seededAt := time.Now()
+	rpsWin.add(seededAt, float64(stats.attempts.Load()))
+	upsWin.add(seededAt, 0)
 
 	refresh := func() {
 		now := time.Now()
 		checked := counts.total()
 		attempts := stats.attempts.Load()
 
-		dt := now.Sub(lastTick).Seconds()
-		rps, ups := 0, 0
-		if dt > 0 {
-			rps = int(float64(attempts-lastAttempts) / dt)
-			ups = int(float64(checked-lastChecked) / dt)
-		}
-		lastTick = now
-		lastAttempts = attempts
-		lastChecked = checked
+		rps := rpsWin.add(now, float64(attempts))
+		ups := upsWin.add(now, float64(checked))
 
 		// The displayed counters are cumulative across rounds.
 		shown := prior
@@ -780,7 +803,7 @@ func runWriter(results <-chan result, cfg *config, con *console, sink *resultSin
 			Total:      total,
 			Counts:     shown,
 			Elapsed:    now.Sub(start),
-			Cus:        lim.current(),
+			Cus:        effectiveConcurrency(lim, workers),
 			ProxiesOK:  pool.healthy(),
 			ProxiesAll: pool.len(),
 		}))
@@ -1140,6 +1163,8 @@ func parseFlags() *config {
 		"report an available name without a second confirming check")
 	flag.BoolVar(&cfg.noAdapt, "no-adapt", false,
 		"disable adaptive concurrency and drive all threads flat out")
+	flag.BoolVar(&cfg.http2, "http2", false,
+		"use HTTP/2 (one connection per host, much lower concurrency)")
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, `Mighty - Instagram username availability checker
@@ -1163,6 +1188,7 @@ options:
   -keep-list            do not remove available names from the usernames file
   -no-confirm           report available names without a confirming re-check
   -no-adapt             disable adaptive concurrency (drive threads flat out)
+  -http2                use HTTP/2 (one connection per host, far less parallel)
   -update               check for a new version and update in place
   -version              print the version and exit
   -no-update-check      skip the startup update check

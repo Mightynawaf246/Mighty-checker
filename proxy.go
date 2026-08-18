@@ -293,10 +293,32 @@ type clientCache struct {
 	// them, which caps throughput well below the thread count. Scaling this with
 	// the worker count is what actually makes a high -t pay off.
 	idlePerHost int
+
+	// http2 opts back into HTTP/2. It is off by default, and that is the single
+	// biggest throughput setting in this tool.
+	//
+	// Over HTTP/2 the whole pool collapses to ONE TCP connection per host, and
+	// every request becomes a stream multiplexed on it. The server caps how many
+	// streams may be open at once (typically around a hundred), and Go queues
+	// the rest. So the real concurrency stops being the thread count and becomes
+	// that stream cap — which is why a run with hundreds of threads can sit
+	// stubbornly at roughly a hundred requests per second no matter how high -t
+	// goes. Over HTTP/1.1 each in-flight request gets its own connection, up to
+	// MaxIdleConnsPerHost, so concurrency actually tracks the thread count.
+	//
+	// The requests here are tiny and keep-alive reuse is high, so HTTP/1.1 costs
+	// nothing meaningful in handshakes and buys back the parallelism.
+	http2 bool
 }
 
 func newClientCache(timeout time.Duration) *clientCache {
 	return newClientCacheFor(timeout, 0)
+}
+
+// withHTTP2 opts the cache into HTTP/2. Call before any client is built.
+func (c *clientCache) withHTTP2(on bool) *clientCache {
+	c.http2 = on
+	return c
 }
 
 // newClientCacheFor sizes the connection pools for a given worker count.
@@ -332,8 +354,16 @@ func (c *clientCache) clientFor(p *proxySpec) (*http.Client, error) {
 		TLSHandshakeTimeout:   c.timeout,
 		ExpectContinueTimeout: time.Second,
 		ResponseHeaderTimeout: c.timeout,
-		ForceAttemptHTTP2:     true,
+		ForceAttemptHTTP2:     c.http2,
 		TLSClientConfig:       &tls.Config{MinVersion: tls.VersionTLS12},
+	}
+	if !c.http2 {
+		// ForceAttemptHTTP2=false alone is not enough: the runtime still
+		// negotiates h2 through ALPN whenever it builds the TLS config itself.
+		// A non-nil, empty TLSNextProto is what actually pins the transport to
+		// HTTP/1.1, so the connection pool above is really used.
+		tr.TLSNextProto = map[string]func(string, *tls.Conn) http.RoundTripper{}
+		tr.TLSClientConfig.NextProtos = []string{"http/1.1"}
 	}
 
 	switch {

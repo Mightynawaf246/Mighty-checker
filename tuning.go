@@ -110,11 +110,21 @@ func (l *adaptiveLimiter) release() {
 		l.inflight--
 	}
 	l.mu.Unlock()
-	l.cond.Broadcast()
+	// Signal, not Broadcast: one freed slot can admit exactly one waiter, and
+	// waking all of them at a high thread count just makes hundreds of
+	// goroutines contend for the mutex and park again. Broadcast is reserved for
+	// the cap actually widening, which can admit several at once.
+	l.cond.Signal()
 }
 
-// onClean records a definite answer (available or taken). Enough of them in a
-// row and the cap grows by one.
+// cleanStreakForGrowth is how many clean answers in a row it takes to widen the
+// cap. Flat rather than proportional to the current cap: making it proportional
+// means the lower the cap has fallen, the harder it is to climb back, which is
+// exactly backwards — a run that got cut is the one that needs to recover fast.
+const cleanStreakForGrowth = 16
+
+// onClean records a definite answer (available or taken) and widens the cap
+// once enough of them have arrived in a row.
 func (l *adaptiveLimiter) onClean() {
 	if l == nil || !l.enabled {
 		return
@@ -123,15 +133,22 @@ func (l *adaptiveLimiter) onClean() {
 	defer l.mu.Unlock()
 
 	l.okStreak++
-	// Require more clean answers for each step up, so the cap creeps toward the
-	// ceiling instead of oscillating around it.
-	need := int(math.Max(8, l.limit/2))
-	if l.okStreak >= need && l.limit < l.max {
-		l.limit = math.Min(l.max, l.limit+1)
-		l.okStreak = 0
-		l.increases++
-		l.cond.Broadcast()
+	if l.okStreak < cleanStreakForGrowth || l.limit >= l.max {
+		return
 	}
+	l.okStreak = 0
+
+	// Well below the ceiling, recovery is what matters, so grow geometrically:
+	// climbing from 1 back to 500 one step at a time would take the rest of the
+	// run. Near the ceiling, creep by one instead, so the cap settles on the
+	// sustainable rate rather than overshooting and being cut again.
+	step := 1.0
+	if l.limit < l.max/2 {
+		step = l.limit * 0.5
+	}
+	l.limit = math.Min(l.max, l.limit+step)
+	l.increases++
+	l.cond.Broadcast()
 }
 
 // onThrottle records a throttle signal (429/5xx, or an unknown response, which
@@ -186,4 +203,57 @@ func backoffFor(retryAfter string, def, max time.Duration) time.Duration {
 		d = 0
 	}
 	return d
+}
+
+// rateWindow smooths a monotonically increasing counter into a per-second rate
+// measured over a trailing window.
+//
+// Why not just divide the delta by the time since the last refresh: the status
+// line refreshes every 120ms, and any tick in which nothing happened to land
+// reads as exactly zero. That is what makes the number flicker between a real
+// rate and 0 several times a second — the rate did not actually drop, the
+// sampling window was just too short to catch anything. Averaging over a couple
+// of seconds reports the rate that is really happening.
+type rateWindow struct {
+	samples []rateSample
+	span    time.Duration
+}
+
+type rateSample struct {
+	at    time.Time
+	value float64
+}
+
+func newRateWindow(span time.Duration) *rateWindow {
+	return &rateWindow{span: span}
+}
+
+// add records the counter's current value and returns the rate per second
+// across the window. The first call establishes the baseline and returns 0.
+func (w *rateWindow) add(now time.Time, value float64) int {
+	w.samples = append(w.samples, rateSample{at: now, value: value})
+
+	// Drop samples that have fallen out of the window, but keep the newest one
+	// that is already outside it: that is the baseline the window measures
+	// against, so discarding it would shorten the window instead of sliding it.
+	cutoff := now.Add(-w.span)
+	drop := 0
+	for i, s := range w.samples {
+		if s.at.After(cutoff) {
+			break
+		}
+		drop = i
+	}
+	w.samples = w.samples[drop:]
+
+	first := w.samples[0]
+	dt := now.Sub(first.at).Seconds()
+	if dt <= 0 {
+		return 0
+	}
+	rate := (value - first.value) / dt
+	if rate < 0 {
+		return 0
+	}
+	return int(rate)
 }

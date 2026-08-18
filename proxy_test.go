@@ -1,6 +1,11 @@
 package main
 
 import (
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -388,5 +393,111 @@ func TestProxyPoolEmptyIsDirect(t *testing.T) {
 	pool.markFail(nil)
 	if pool.healthy() != 0 || pool.len() != 0 {
 		t.Error("an empty pool must report zero proxies")
+	}
+}
+
+// ------------------------------------------------------- transport parallelism
+
+// HTTP/2 collapses the whole connection pool to one TCP connection per host and
+// caps in-flight work at the server's stream limit, which is what pins a
+// high-thread run to a low request rate. The default must therefore be
+// HTTP/1.1, and pinning it takes both settings: ForceAttemptHTTP2=false alone
+// still lets ALPN negotiate h2 when the runtime builds the TLS config.
+func TestDefaultTransportIsPinnedToHTTP1(t *testing.T) {
+	c := newClientCacheFor(5*time.Second, 100)
+	cl, err := c.clientFor(nil)
+	if err != nil {
+		t.Fatalf("clientFor: %v", err)
+	}
+	tr := cl.Transport.(*http.Transport)
+
+	if tr.ForceAttemptHTTP2 {
+		t.Error("HTTP/2 must not be attempted by default")
+	}
+	if tr.TLSNextProto == nil || len(tr.TLSNextProto) != 0 {
+		t.Error("TLSNextProto must be non-nil and empty to actually pin HTTP/1.1")
+	}
+	if got := tr.TLSClientConfig.NextProtos; len(got) != 1 || got[0] != "http/1.1" {
+		t.Errorf("ALPN should offer only http/1.1, got %v", got)
+	}
+	if tr.MaxIdleConnsPerHost != 100 {
+		t.Errorf("pool should be sized from the thread count, got %d", tr.MaxIdleConnsPerHost)
+	}
+}
+
+// -http2 must genuinely opt back in.
+func TestHTTP2FlagOptsBackIn(t *testing.T) {
+	c := newClientCacheFor(5*time.Second, 100).withHTTP2(true)
+	cl, err := c.clientFor(nil)
+	if err != nil {
+		t.Fatalf("clientFor: %v", err)
+	}
+	tr := cl.Transport.(*http.Transport)
+
+	if !tr.ForceAttemptHTTP2 {
+		t.Error("-http2 should attempt HTTP/2")
+	}
+	if tr.TLSNextProto != nil {
+		t.Error("-http2 must not pin the transport to HTTP/1.1")
+	}
+}
+
+// The point of the pool is that concurrent requests get concurrent connections.
+// If they did not, the thread count would be decorative.
+func TestPoolOpensConcurrentConnections(t *testing.T) {
+	const concurrent = 24
+
+	var mu sync.Mutex
+	open, peak := 0, 0
+
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(50 * time.Millisecond) // hold the connection so overlap is visible
+		fmt.Fprint(w, "ok")
+	}))
+	srv.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+		mu.Lock()
+		defer mu.Unlock()
+		switch state {
+		case http.StateNew:
+			open++
+			if open > peak {
+				peak = open
+			}
+		case http.StateClosed, http.StateHijacked:
+			open--
+		}
+	}
+	srv.Start()
+	defer srv.Close()
+
+	cl, err := newClientCacheFor(5*time.Second, concurrent).clientFor(nil)
+	if err != nil {
+		t.Fatalf("clientFor: %v", err)
+	}
+
+	var wg sync.WaitGroup
+	for i := 0; i < concurrent; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			resp, err := cl.Get(srv.URL)
+			if err != nil {
+				return
+			}
+			io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+		}()
+	}
+	wg.Wait()
+
+	mu.Lock()
+	got := peak
+	mu.Unlock()
+
+	// Allow slack for scheduling, but a single shared connection is the failure
+	// this guards against.
+	if got < concurrent/2 {
+		t.Errorf("peak concurrent connections %d, want near %d - "+
+			"requests are being serialized onto too few connections", got, concurrent)
 	}
 }

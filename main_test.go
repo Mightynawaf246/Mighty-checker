@@ -745,3 +745,90 @@ func TestHighThreadCountUnderThrottlingCompletes(t *testing.T) {
 		t.Fatal("the run deadlocked at 300 threads")
 	}
 }
+
+// A stream of unknown answers is one proxy being soft blocked, not the endpoint
+// asking everybody to slow down. It must not cut global concurrency: doing so
+// let a handful of bad proxies collapse the whole run's speed to the floor.
+func TestUnknownAnswersDoNotCutConcurrency(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, bodyGarbage) // HTTP 200, unrecognizable body -> unknown
+	}))
+	t.Cleanup(srv.Close)
+	withEndpoint(t, srv.URL)
+
+	cfg := &config{threads: 64, timeout: 5 * time.Second, retries: 1,
+		outDir: t.TempDir(), quiet: true}
+	lim := newAdaptiveLimiter(cfg.threads, true)
+
+	var usernames []string
+	for i := 0; i < 200; i++ {
+		usernames = append(usernames, fmt.Sprintf("name%d", i))
+	}
+
+	sink := newResultSink(cfg)
+	counts := runPipeline(context.Background(), usernames, newProxyPool(nil),
+		newClientCacheFor(cfg.timeout, cfg.threads), cfg, sink, &liveStats{},
+		lim, 1, time.Now(), tally{})
+	sink.close()
+
+	if counts.unknown != len(usernames) {
+		t.Fatalf("want every name unknown, got %+v", counts)
+	}
+	if got := lim.current(); got != cfg.threads {
+		t.Errorf("unknown answers cut the cap from %d to %d", cfg.threads, got)
+	}
+}
+
+// An explicit 429 does speak for the endpoint, and must cut the cap.
+func TestThrottleResponsesCutConcurrency(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Retry-After", "0")
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	t.Cleanup(srv.Close)
+	withEndpoint(t, srv.URL)
+
+	cfg := &config{threads: 64, timeout: 5 * time.Second, retries: 1,
+		outDir: t.TempDir(), quiet: true}
+	lim := newAdaptiveLimiter(cfg.threads, true)
+
+	var usernames []string
+	for i := 0; i < 40; i++ {
+		usernames = append(usernames, fmt.Sprintf("name%d", i))
+	}
+
+	sink := newResultSink(cfg)
+	runPipeline(context.Background(), usernames, newProxyPool(nil),
+		newClientCacheFor(cfg.timeout, cfg.threads), cfg, sink, &liveStats{},
+		lim, 1, time.Now(), tally{})
+	sink.close()
+
+	if got := lim.current(); got >= cfg.threads {
+		t.Errorf("a run of 429s should have cut the cap, still %d", got)
+	}
+}
+
+// The concurrency shown must be what can really be in flight. A list that has
+// shrunk to a couple of names caps the workers, and that is the honest ceiling
+// no matter how high the adaptive cap is.
+func TestEffectiveConcurrencyIsBoundedByWorkers(t *testing.T) {
+	lim := newAdaptiveLimiter(500, true)
+
+	if got := effectiveConcurrency(lim, 2); got != 2 {
+		t.Errorf("two names left: want 2, got %d", got)
+	}
+	if got := effectiveConcurrency(lim, 500); got != 500 {
+		t.Errorf("full list: want 500, got %d", got)
+	}
+
+	lim.onThrottle()
+	if got := effectiveConcurrency(lim, 500); got != lim.current() {
+		t.Errorf("a cut cap must show through: want %d, got %d", lim.current(), got)
+	}
+
+	// With adaptation off the worker count is the only ceiling.
+	off := newAdaptiveLimiter(500, false)
+	if got := effectiveConcurrency(off, 300); got != 300 {
+		t.Errorf("-no-adapt: want 300, got %d", got)
+	}
+}

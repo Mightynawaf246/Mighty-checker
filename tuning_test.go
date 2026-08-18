@@ -177,3 +177,100 @@ func TestBackoffFor(t *testing.T) {
 		t.Errorf("past date: want the default %v, got %v", def, got)
 	}
 }
+
+// Recovery from the floor must be fast. Climbing one step at a time from 1 back
+// to a high ceiling would take longer than the run itself, which is what made a
+// throttled run stay slow forever.
+func TestAdaptiveLimiterRecoversQuicklyFromTheFloor(t *testing.T) {
+	lim := newAdaptiveLimiter(500, true)
+	for i := 0; i < 100; i++ {
+		lim.onThrottle()
+	}
+	if got := lim.current(); got != 1 {
+		t.Fatalf("setup: want the floor, got %d", got)
+	}
+
+	// Feed clean answers and count how many it takes to get back to half the
+	// ceiling. Geometric growth needs a few hundred; one-step growth would need
+	// hundreds of thousands.
+	n := 0
+	for lim.current() < 250 && n < 20000 {
+		lim.onClean()
+		n++
+	}
+	if lim.current() < 250 {
+		t.Fatalf("never recovered: cap %d after %d clean answers", lim.current(), n)
+	}
+	if n > 2000 {
+		t.Errorf("recovery took %d clean answers, far too slow", n)
+	}
+}
+
+// A rate must not read zero just because one sampling tick happened to be
+// empty. That flicker between a real number and 0 is a measurement artifact,
+// not a real drop in throughput.
+func TestRateWindowDoesNotFlickerToZero(t *testing.T) {
+	w := newRateWindow(3 * time.Second)
+	base := time.Now()
+
+	// 100 events per second, but arriving in bursts every 500ms, so most 120ms
+	// ticks see nothing at all.
+	total := 0.0
+	w.add(base, 0)
+
+	zeros, ticks := 0, 0
+	for i := 1; i <= 100; i++ { // 100 ticks x 120ms = 12s
+		at := base.Add(time.Duration(i) * 120 * time.Millisecond)
+		if i%4 == 0 {
+			total += 48 // a burst every ~480ms, averaging 100/s
+		}
+		rate := w.add(at, total)
+		if i > 25 { // let the window fill first
+			ticks++
+			if rate == 0 {
+				zeros++
+			}
+		}
+	}
+	if ticks == 0 {
+		t.Fatal("no ticks measured")
+	}
+	if zeros > 0 {
+		t.Errorf("rate read zero on %d of %d ticks despite steady traffic", zeros, ticks)
+	}
+}
+
+// The smoothed rate must still be roughly right, not just non-zero.
+func TestRateWindowIsAccurate(t *testing.T) {
+	w := newRateWindow(3 * time.Second)
+	base := time.Now()
+	w.add(base, 0)
+
+	var last int
+	for i := 1; i <= 100; i++ {
+		at := base.Add(time.Duration(i) * 100 * time.Millisecond)
+		last = w.add(at, float64(i)*20) // 20 per 100ms = 200/s
+	}
+	if last < 190 || last > 210 {
+		t.Errorf("want about 200/s, got %d", last)
+	}
+}
+
+// A counter that does not move must report zero, and the first sample has no
+// baseline to measure against so it must not divide by zero.
+func TestRateWindowEdgeCases(t *testing.T) {
+	w := newRateWindow(time.Second)
+	now := time.Now()
+	if got := w.add(now, 500); got != 0 {
+		t.Errorf("first sample: want 0, got %d", got)
+	}
+	if got := w.add(now, 500); got != 0 {
+		t.Errorf("no elapsed time: want 0, got %d", got)
+	}
+	for i := 1; i <= 20; i++ {
+		w.add(now.Add(time.Duration(i)*100*time.Millisecond), 500)
+	}
+	if got := w.add(now.Add(3*time.Second), 500); got != 0 {
+		t.Errorf("idle counter: want 0, got %d", got)
+	}
+}

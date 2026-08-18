@@ -122,13 +122,37 @@ produce more answers, it produces throttled ones, which can only be reported as
 `unknown` — so over-driving costs throughput **and** correctness at once. Three
 mechanisms keep both:
 
+**HTTP/1.1 by default.** This is the single biggest throughput setting. Over
+HTTP/2 the entire connection pool collapses to *one TCP connection per host*,
+and every request becomes a stream multiplexed on it; the server caps how many
+streams may be open at once (typically around a hundred) and the rest queue. Real
+concurrency then stops being your thread count and becomes that stream cap —
+which is why a run with hundreds of threads can sit stubbornly near a hundred
+requests per second no matter how high `-t` goes. Over HTTP/1.1 each in-flight
+request gets its own connection, so throughput tracks the thread count:
+
+| `-t` | usernames/sec against a 60ms endpoint |
+|------|---------------------------------------|
+| 50 | 776 |
+| 200 | 2 975 |
+| 500 | 7 409 |
+
+The requests here are tiny and keep-alive reuse is high, so HTTP/1.1 costs
+nothing meaningful in handshakes. `-http2` opts back in if you want to compare.
+
 **Adaptive concurrency.** `-t` is the ceiling, not the pace. The run starts at
-the full thread count and then tunes itself: a run of clean answers raises the
-live cap by one, a throttle signal cuts it by 30%. That is the same
-additive-increase / multiplicative-decrease law TCP uses for congestion, and it
-settles just below the point where throttling starts — the fastest rate that
-still yields definite answers. The live cap is the `CUS` field in the status
-line. Turn it off with `-no-adapt` if you want to drive all threads flat out.
+the full thread count and then tunes itself: a run of clean answers widens the
+live cap, an explicit throttle cuts it by 30%. That is the additive-increase /
+multiplicative-decrease law TCP uses for congestion, and it settles just below
+the point where throttling starts — the fastest rate that still yields definite
+answers. Recovery is geometric while the cap is well below the ceiling, so a run
+that got cut climbs back in seconds rather than never.
+
+Only an explicit `429`/`5xx` counts as a throttle: an `unknown` answer means
+*that one proxy* is soft blocked, and the quarantine below already handles it.
+Letting every unknown cut the global cap made a handful of bad proxies collapse
+the whole run to the floor. The live cap is the `CUS` field in the status line;
+`-no-adapt` turns tuning off.
 
 **Proxy quarantine.** Three consecutive failures put a proxy to sleep for 60
 seconds; the rotation skips it and the `PX` field shows how many are still
@@ -159,9 +183,31 @@ sends one, with exponential backoff otherwise.
 | `UPS` | usernames checked per second |
 | `Att` | total requests sent |
 | `Chk` | checked out of the round total, with percentage |
-| `CUS` | concurrency in use — the live adaptive cap (hidden with `-no-adapt`) |
+| `CUS` | concurrency in use — the adaptive cap, or the worker count if lower |
 | `PX` | healthy proxies out of the total (hidden without proxies) |
 | `A / T / U / E` | available / taken / unknown / errors |
+
+## If RPS looks low
+
+Check `CUS` first — it is the concurrency that can really be in flight, and it
+explains almost every slow run:
+
+- **`CUS` equals your `-t`** — you are already running flat out. The limit is
+  proxy count and latency: throughput is roughly `concurrency / latency`, so 500
+  workers against 300ms proxies is about 1 600 requests/sec. More speed means
+  more proxies, not more threads.
+- **`CUS` is far below `-t`** — the endpoint is throttling and the cap was cut.
+  Watch `U` (unknown) and `PX`: if `PX` is dropping, proxies are being
+  quarantined and you need better ones.
+- **`CUS` is a small number like `2`** — that is the list, not the tool. Workers
+  are capped at the number of names left, and in loop mode the list shrinks as
+  names are found. Two names left means two workers, and `RPS` will be tiny no
+  matter what `-t` says. This is correct: firing 500 threads at the same two
+  names would just get you blocked.
+
+`RPS` and `UPS` are averaged over a three second window, so they show the rate
+that is actually happening rather than flickering to zero whenever a single
+120ms refresh tick happens to be empty.
 
 ## Usage
 
@@ -193,6 +239,7 @@ sends one, with exponential backoff otherwise.
 | `-keep-list` | do not remove available names from the list | — |
 | `-no-confirm` | report available names without a confirming re-check | — |
 | `-no-adapt` | disable adaptive concurrency (drive threads flat out) | — |
+| `-http2` | use HTTP/2 (one connection per host, far less parallel) | — |
 | `-verbose` | log every result, not just available | — |
 | `-no-color` | disable colors and the live status line | — |
 | `-webhook` | webhook URL notified on an available name | — |
