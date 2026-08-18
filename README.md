@@ -173,6 +173,16 @@ healthy. A soft-blocked proxy stops burning requests instead of producing a
 stream of `unknown`. One success clears the streak, so a single blip costs
 nothing.
 
+**Latency steering.** A slow proxy is far more expensive than it looks. A worker
+is occupied for the whole round trip, so a proxy answering in 3s costs the run
+nearly forty times what an 80ms one does — and because the slow ones hold their
+workers longest, they end up occupying a share of your threads wildly out of
+proportion to their number. The pool tracks each proxy's recent round-trip time
+and steps over any that is more than four times slower than the fastest one,
+while still probing it periodically so it can earn its way back. On a pool that
+is 20% slow proxies this measured 138 → 338 checks/sec, a 2.4x gain, with no
+change to the proxy list at all.
+
 **Confirmed availability.** A first `available` answer is re-checked through a
 different proxy before the name is reported. If the two disagree, taken wins; if
 the second check cannot be completed, the name is reported `unknown` rather than
@@ -199,6 +209,31 @@ sends one, with exponential backoff otherwise.
 | `CUS` | concurrency in use — the adaptive cap, or the worker count if lower |
 | `PX` | healthy proxies out of the total (hidden without proxies) |
 | `A / T / U / E` | available / taken / unknown / errors |
+
+## Raising UPS
+
+`UPS` is `concurrency / latency`, so there are exactly two levers, and `CUS`
+tells you which one you are short of.
+
+**1. More concurrency.** Raise `-t`, and turn off the automatic slowdown with
+`-no-adapt` (or the menu question) so the number you set is the number you get.
+This only helps while `CUS` is actually reaching your `-t`.
+
+**2. Less latency.** This is usually the real limit, and it is mostly your proxy
+list. Two settings matter here:
+
+- **`-timeout`** — the default is `10s`, which means a hung proxy occupies a
+  worker for ten full seconds before it is given up on. On a decent list
+  `-timeout 4s` frees those workers more than twice as fast. Set it too low and
+  healthy-but-slow proxies start failing, so watch `E` after changing it.
+- **`-retries 1`** (the default) — every extra attempt is another round trip.
+
+Beyond that, more proxies is the only real answer: throughput is roughly
+`concurrency / latency`, so 500 workers against 300ms proxies is about 1 600
+checks/sec no matter what else you change.
+
+**What will not help:** `-delay` and `-jitter` above zero (they exist to slow you
+down deliberately), and `-http2`.
 
 ## If RPS looks low
 

@@ -189,13 +189,55 @@ type proxyPool struct {
 
 	maxFails   int           // failures before quarantine
 	quarantine time.Duration // how long a bad proxy is skipped
+
+	// latency holds a per-proxy exponentially weighted average round-trip time
+	// in milliseconds, and avgLatency the same across the whole pool.
+	//
+	// These exist because a slow proxy is far more expensive than it looks. A
+	// worker is occupied for the entire round trip, so a proxy answering in 5s
+	// costs the run fifty times what a 100ms one does — and because the slow
+	// ones hold their workers longest, they end up occupying a share of the
+	// pool wildly out of proportion to their number. Steering around them is
+	// the cheapest throughput there is.
+	latency map[string]float64
+	skips   map[string]int // consecutive turns skipped for slowness
+
+	// best is the fastest observed latency in the pool, refreshed at most every
+	// bestRefresh so a large pool is not rescanned on every single pick.
+	//
+	// The comparison is against the fastest proxy rather than the pool average
+	// on purpose: an average is dragged upward by the very proxies it is meant
+	// to identify, so once slow ones are a large share of the pool they stop
+	// looking slow relative to it and the steering quietly stops working. The
+	// fastest proxy is a stable reference no matter what fraction is bad.
+	best   float64
+	bestAt time.Time
 }
+
+const (
+	// slowLatencyFactor is how many times slower than the pool's fastest proxy
+	// a proxy must be before the rotation starts stepping over it.
+	slowLatencyFactor = 4.0
+
+	// bestRefresh is how often the fastest-proxy reference is recomputed.
+	bestRefresh = 200 * time.Millisecond
+
+	// slowProbeInterval is how many skipped turns a slow proxy gets before it
+	// is used anyway, to take a fresh measurement.
+	//
+	// Without this a proxy skipped for slowness would never be measured again,
+	// so a single bad patch would exile it for the rest of the run even after
+	// it recovered. Its latency is only ever updated by actually using it.
+	slowProbeInterval = 20
+)
 
 func newProxyPool(items []*proxySpec) *proxyPool {
 	return &proxyPool{
 		items:      items,
 		fails:      make(map[string]int),
 		sleeping:   make(map[string]time.Time),
+		latency:    make(map[string]float64),
+		skips:      make(map[string]int),
 		maxFails:   3,
 		quarantine: 60 * time.Second,
 	}
@@ -218,22 +260,68 @@ func (p *proxyPool) next() *proxySpec {
 	n := uint64(len(p.items))
 	now := time.Now()
 
+	p.mu.Lock()
+	if now.Sub(p.bestAt) > bestRefresh {
+		p.best, p.bestAt = 0, now
+		for _, v := range p.latency {
+			if v > 0 && (p.best == 0 || v < p.best) {
+				p.best = v
+			}
+		}
+	}
+	slowCutoff := 0.0
+	if p.best > 0 {
+		slowCutoff = p.best * slowLatencyFactor
+	}
+	p.mu.Unlock()
+
+	// Never step over more than half the pool for slowness. A pool that is
+	// uniformly slow is still the pool you have, and rejecting it wholesale
+	// would stall the run rather than speed it up.
+	slowBudget := len(p.items) / 2
+
+	// Rotation stays round-robin. That matters beyond fairness: the confirming
+	// re-check of an available name relies on consecutive calls handing out
+	// different proxies, which random selection would not guarantee.
 	for tries := 0; tries < len(p.items); tries++ {
 		cand := p.items[(p.idx.Add(1)-1)%n]
+		k := cand.key()
+
 		p.mu.Lock()
-		until, sleeping := p.sleeping[cand.key()]
-		p.mu.Unlock()
-		if !sleeping || now.After(until) {
-			return cand
+		until, sleeping := p.sleeping[k]
+		lat := p.latency[k]
+		skip := slowCutoff > 0 && lat > slowCutoff && slowBudget > 0
+		if skip {
+			// Let it through every so often regardless, so it gets re-measured
+			// and can earn its way back.
+			p.skips[k]++
+			if p.skips[k] >= slowProbeInterval {
+				p.skips[k] = 0
+				skip = false
+			}
+		} else {
+			delete(p.skips, k)
 		}
+		p.mu.Unlock()
+
+		if sleeping && !now.After(until) {
+			continue
+		}
+		if skip {
+			slowBudget--
+			continue
+		}
+		return cand
 	}
 	// Everything is quarantined: fall back to plain rotation so the run
 	// continues and the cooldowns get a chance to expire.
 	return p.items[(p.idx.Add(1)-1)%n]
 }
 
-// markOK clears the failure streak for a proxy that just worked.
-func (p *proxyPool) markOK(s *proxySpec) {
+// markOK clears the failure streak for a proxy that just worked and folds its
+// round-trip time into the latency averages. A zero duration records nothing,
+// so callers without a timing can still report success.
+func (p *proxyPool) markOK(s *proxySpec, took time.Duration) {
 	if p == nil || s == nil {
 		return
 	}
@@ -242,6 +330,16 @@ func (p *proxyPool) markOK(s *proxySpec) {
 	k := s.key()
 	delete(p.fails, k)
 	delete(p.sleeping, k)
+
+	if took <= 0 {
+		return
+	}
+	ms := float64(took.Microseconds()) / 1000
+	if cur, ok := p.latency[k]; ok {
+		p.latency[k] = cur*0.7 + ms*0.3
+	} else {
+		p.latency[k] = ms
+	}
 }
 
 // markFail records a failure and quarantines the proxy once it has failed

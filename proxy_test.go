@@ -340,7 +340,7 @@ func TestProxyPoolSuccessClearsFailures(t *testing.T) {
 
 	pool.markFail(p)
 	pool.markFail(p)
-	pool.markOK(p)
+	pool.markOK(p, 0)
 	pool.markFail(p)
 
 	if got := pool.healthy(); got != 2 {
@@ -389,7 +389,7 @@ func TestProxyPoolEmptyIsDirect(t *testing.T) {
 	if pool.next() != nil {
 		t.Error("an empty pool must return nil (direct connection)")
 	}
-	pool.markOK(nil)
+	pool.markOK(nil, 0)
 	pool.markFail(nil)
 	if pool.healthy() != 0 || pool.len() != 0 {
 		t.Error("an empty pool must report zero proxies")
@@ -499,5 +499,138 @@ func TestPoolOpensConcurrentConnections(t *testing.T) {
 	if got < concurrent/2 {
 		t.Errorf("peak concurrent connections %d, want near %d - "+
 			"requests are being serialized onto too few connections", got, concurrent)
+	}
+}
+
+// -------------------------------------------------------- latency steering
+
+// A proxy far slower than the rest holds a worker for its whole round trip, so
+// the rotation must start stepping over it rather than handing it the same
+// share of the work as the fast ones.
+func TestProxyPoolAvoidsSlowProxies(t *testing.T) {
+	pool := testPool(t,
+		"http://1.1.1.1:8080", "http://2.2.2.2:8080",
+		"http://3.3.3.3:8080", "http://4.4.4.4:8080")
+	slow := pool.items[0]
+
+	// Establish the picture: three fast proxies and one that is an order of
+	// magnitude slower.
+	for i := 0; i < 20; i++ {
+		for _, p := range pool.items[1:] {
+			pool.markOK(p, 100*time.Millisecond)
+		}
+		pool.markOK(slow, 5*time.Second)
+	}
+
+	counts := map[string]int{}
+	for i := 0; i < 400; i++ {
+		counts[pool.next().key()]++
+	}
+
+	slowShare := counts[slow.key()]
+	if slowShare == 0 {
+		t.Fatalf("the slow proxy was dropped entirely; it should still be used sometimes")
+	}
+	// Round-robin alone would give it a quarter of the traffic.
+	if slowShare > 400/8 {
+		t.Errorf("slow proxy got %d/400 requests, want well under the %d "+
+			"a plain rotation would give it", slowShare, 400/4)
+	}
+}
+
+// A pool that is uniformly slow is still the pool you have. Nothing may be
+// skipped when everything is equally slow, or the run would stall.
+func TestProxyPoolUniformlySlowIsStillUsed(t *testing.T) {
+	pool := testPool(t, "http://1.1.1.1:8080", "http://2.2.2.2:8080", "http://3.3.3.3:8080")
+	for i := 0; i < 20; i++ {
+		for _, p := range pool.items {
+			pool.markOK(p, 4*time.Second)
+		}
+	}
+
+	counts := map[string]int{}
+	for i := 0; i < 300; i++ {
+		counts[pool.next().key()]++
+	}
+	if len(counts) != 3 {
+		t.Fatalf("want all 3 proxies used, got %d", len(counts))
+	}
+	for k, n := range counts {
+		if n < 80 {
+			t.Errorf("proxy %s got only %d/300 - the rotation is skipping unfairly", k, n)
+		}
+	}
+}
+
+// Rotation must stay round-robin: the confirming re-check of an available name
+// depends on two consecutive calls returning different proxies.
+func TestProxyPoolConsecutiveCallsDiffer(t *testing.T) {
+	pool := testPool(t, "http://1.1.1.1:8080", "http://2.2.2.2:8080", "http://3.3.3.3:8080")
+	for i := 0; i < 60; i++ {
+		a, b := pool.next(), pool.next()
+		if a.key() == b.key() {
+			t.Fatalf("two consecutive picks returned the same proxy %s", a)
+		}
+	}
+}
+
+// Reporting success without a timing must not corrupt the averages.
+func TestProxyPoolMarkOKWithoutTimingIsInert(t *testing.T) {
+	pool := testPool(t, "http://1.1.1.1:8080")
+	pool.markOK(pool.items[0], 0)
+	if pool.best != 0 {
+		t.Errorf("a zero duration should record nothing, best = %v", pool.best)
+	}
+	if len(pool.latency) != 0 {
+		t.Errorf("a zero duration should record nothing, latency = %v", pool.latency)
+	}
+}
+
+// A slow proxy that speeds up must come back into full rotation: the average is
+// a moving one, not a verdict.
+func TestProxyPoolSlowProxyRecovers(t *testing.T) {
+	pool := testPool(t, "http://1.1.1.1:8080", "http://2.2.2.2:8080")
+	slow := pool.items[0]
+
+	for i := 0; i < 20; i++ {
+		pool.markOK(pool.items[1], 100*time.Millisecond)
+		pool.markOK(slow, 5*time.Second)
+	}
+	for i := 0; i < 50; i++ {
+		pool.markOK(slow, 100*time.Millisecond)
+	}
+
+	counts := map[string]int{}
+	for i := 0; i < 200; i++ {
+		counts[pool.next().key()]++
+	}
+	if counts[slow.key()] < 80 {
+		t.Errorf("a recovered proxy should be back in full rotation, got %d/200",
+			counts[slow.key()])
+	}
+}
+
+// A proxy skipped for slowness must still be probed occasionally: its latency
+// is only ever updated by using it, so permanent exile would be permanent.
+func TestProxyPoolReprobesSkippedProxies(t *testing.T) {
+	pool := testPool(t, "http://1.1.1.1:8080", "http://2.2.2.2:8080")
+	slow := pool.items[0]
+
+	for i := 0; i < 20; i++ {
+		pool.markOK(pool.items[1], 100*time.Millisecond)
+		pool.markOK(slow, 5*time.Second)
+	}
+
+	used := 0
+	for i := 0; i < 500; i++ {
+		if pool.next().key() == slow.key() {
+			used++
+		}
+	}
+	if used == 0 {
+		t.Fatal("a slow proxy is never re-probed, so it can never recover")
+	}
+	if used > 100 {
+		t.Errorf("the slow proxy is being probed too often: %d/500", used)
 	}
 }

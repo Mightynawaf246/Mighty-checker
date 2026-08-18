@@ -602,7 +602,9 @@ func attemptOnce(ctx context.Context, username string, pool *proxyPool,
 	if stats != nil {
 		stats.attempts.Add(1)
 	}
+	started := time.Now()
 	resp, err := checkOnce(rctx, client, username)
+	took := time.Since(started)
 	if cancel != nil {
 		cancel()
 	}
@@ -622,7 +624,7 @@ func attemptOnce(ctx context.Context, username string, pool *proxyPool,
 	switch out.status {
 	case statusAvailable, statusTaken:
 		// A definite answer means this proxy works and the rate is sustainable.
-		pool.markOK(p)
+		pool.markOK(p, took)
 		lim.onClean()
 	default:
 		// An unknown answer nearly always means this one proxy is soft blocked,
