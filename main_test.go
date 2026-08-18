@@ -832,3 +832,39 @@ func TestEffectiveConcurrencyIsBoundedByWorkers(t *testing.T) {
 		t.Errorf("-no-adapt: want 300, got %d", got)
 	}
 }
+
+// With -no-adapt the run must stay at full threads even while the endpoint is
+// throttling: the thread count becomes a target, not a ceiling.
+func TestNoAdaptKeepsFullConcurrencyUnderThrottling(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Retry-After", "0")
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	t.Cleanup(srv.Close)
+	withEndpoint(t, srv.URL)
+
+	cfg := &config{threads: 64, timeout: 5 * time.Second, retries: 1,
+		outDir: t.TempDir(), quiet: true, noAdapt: true}
+	lim := newAdaptiveLimiter(cfg.threads, false)
+
+	var usernames []string
+	for i := 0; i < 60; i++ {
+		usernames = append(usernames, fmt.Sprintf("name%d", i))
+	}
+
+	sink := newResultSink(cfg)
+	counts := runPipeline(context.Background(), usernames, newProxyPool(nil),
+		newClientCacheFor(cfg.timeout, cfg.threads), cfg, sink, &liveStats{},
+		lim, 1, time.Now(), tally{})
+	sink.close()
+
+	if counts.total() != len(usernames) {
+		t.Fatalf("want %d results, got %d", len(usernames), counts.total())
+	}
+	// A disabled limiter reports no cap of its own, so the workers are the only
+	// ceiling and the run stays at full width.
+	if got := effectiveConcurrency(lim, len(usernames)); got != len(usernames) {
+		t.Errorf("-no-adapt must not narrow the run: got %d, want %d",
+			got, len(usernames))
+	}
+}

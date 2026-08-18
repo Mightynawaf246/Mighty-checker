@@ -325,6 +325,9 @@ func runInteractiveSetup(cfg *config) bool {
 		case "1":
 			fmt.Println()
 			cfg.threads = askInt("Threads:", cfg.threads)
+			// Offered here because it is the one setting that decides whether
+			// the thread count you just typed is a target or merely a ceiling.
+			cfg.noAdapt = askBool("Always run at full threads (no auto-slowdown)?", cfg.noAdapt)
 			cfg.loop = askBool("Loop forever (keep re-checking)?", cfg.loop)
 			if cfg.loop {
 				cfg.delay = askDuration("Delay between requests:", cfg.delay)

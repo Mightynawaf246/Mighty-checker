@@ -51,6 +51,19 @@ No `go get` needed: the program depends on no external package and builds
 offline. The SOCKS4 and SOCKS5 layers are hand-written because
 `golang.org/x/net/proxy` supports SOCKS5 only and has no SOCKS4 at all.
 
+## Running at full threads
+
+`-no-adapt` (or answering **y** to *"Always run at full threads?"* in the menu)
+removes the automatic slowdown: every worker runs flat out and the thread count
+you set is the concurrency you get, not a ceiling the run may back away from.
+Proxy quarantine still applies, so dead proxies are still rotated out.
+
+Worth knowing before you use it: when the endpoint starts throttling it does not
+answer faster, it answers `429` — and a throttled reply can only be recorded as
+`unknown`. So if `U` climbs steeply after you turn this on, the extra requests
+are not buying extra answers. Watch `U` against `A`+`T` and you will see which
+side you are on.
+
 ## Interactive mode (no flags)
 
 Run the tool with no flags and it shows a menu, then asks for settings:
