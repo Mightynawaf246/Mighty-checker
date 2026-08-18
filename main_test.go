@@ -323,15 +323,16 @@ func TestLoopIsContinuousAndDoesNotRepeatFileLines(t *testing.T) {
 	}
 }
 
-// A name in flight must never be handed to a second worker: checking @foo in
-// five places at once returns the same answer five times and spends five times
-// the rate limit to get it.
-func TestWorklistNeverDuplicatesAName(t *testing.T) {
+// A short list must still be able to use every thread while looping. Capping
+// concurrency at the list size held a 20-name watch to 20 concurrent checks
+// however high -t was set, which is the difference between tens of requests a
+// second and thousands.
+func TestLoopUsesEveryThreadOnAShortList(t *testing.T) {
 	wl := newWorklist([]string{"a", "b", "c"}, true)
 
 	var mu sync.Mutex
-	live := map[string]bool{}
-	var clash atomic.Bool
+	live := map[string]int{}
+	peak := 0
 
 	var wg sync.WaitGroup
 	ctx, cancel := context.WithCancel(context.Background())
@@ -345,31 +346,111 @@ func TestWorklistNeverDuplicatesAName(t *testing.T) {
 					return
 				}
 				mu.Lock()
-				if live[name] {
-					clash.Store(true)
+				live[name]++
+				n := 0
+				for _, c := range live {
+					n += c
 				}
-				live[name] = true
+				if n > peak {
+					peak = n
+				}
 				mu.Unlock()
 
-				time.Sleep(time.Millisecond)
+				time.Sleep(2 * time.Millisecond)
 
 				mu.Lock()
-				delete(live, name)
+				live[name]--
 				mu.Unlock()
-				wl.release(name)
 			}
 		}()
 	}
-	time.Sleep(150 * time.Millisecond)
+	time.Sleep(200 * time.Millisecond)
 	cancel()
 	wl.close()
 	wg.Wait()
 
-	if clash.Load() {
-		t.Error("the same name was checked by two workers at once")
+	if peak <= 3 {
+		t.Errorf("peak concurrency %d - a 3-name list is still capping the threads", peak)
+	}
+	if peak > 32 {
+		t.Errorf("peak concurrency %d exceeds the thread count", peak)
 	}
 	if wl.passCount() == 0 {
 		t.Error("the list never cycled")
+	}
+}
+
+// A single pass is the opposite case: checking a name twice there spends a
+// request to learn nothing, so each name goes out exactly once.
+func TestSinglePassHandsEachNameOutOnce(t *testing.T) {
+	names := []string{"a", "b", "c", "d", "e"}
+	wl := newWorklist(names, false)
+
+	var mu sync.Mutex
+	got := map[string]int{}
+
+	var wg sync.WaitGroup
+	for i := 0; i < 16; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				name, ok := wl.claim(context.Background())
+				if !ok {
+					return
+				}
+				mu.Lock()
+				got[name]++
+				mu.Unlock()
+			}
+		}()
+	}
+	wg.Wait()
+
+	if len(got) != len(names) {
+		t.Fatalf("handed out %d distinct names, want %d", len(got), len(names))
+	}
+	for name, n := range got {
+		if n != 1 {
+			t.Errorf("%s handed out %d times, want 1", name, n)
+		}
+	}
+}
+
+// A retired name must stop being handed out, and stale results for it must be
+// recognisable so one hit is not counted once per in-flight copy.
+func TestRetiredNamesAreDroppedAndRecognised(t *testing.T) {
+	wl := newWorklist([]string{"a", "b"}, true)
+
+	if wl.retiredName("a") {
+		t.Fatal("nothing is retired yet")
+	}
+	if left := wl.retire("a"); left != 1 {
+		t.Fatalf("left after retiring one of two: %d", left)
+	}
+	if !wl.retiredName("A") {
+		t.Error("retirement must be case-insensitive, like the names themselves")
+	}
+	// Retiring the same name again must not double-count.
+	if left := wl.retire("a"); left != 1 {
+		t.Errorf("retiring twice changed the count to %d", left)
+	}
+
+	for i := 0; i < 50; i++ {
+		name, ok := wl.claim(context.Background())
+		if !ok {
+			t.Fatal("the list still has a live name")
+		}
+		if name == "a" {
+			t.Fatal("a retired name was handed out")
+		}
+	}
+
+	if left := wl.retire("b"); left != 0 {
+		t.Fatalf("left after retiring both: %d", left)
+	}
+	if _, ok := wl.claim(context.Background()); ok {
+		t.Error("an empty list must stop handing out names")
 	}
 }
 

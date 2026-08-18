@@ -366,11 +366,10 @@ func printSpeedDiagnosis(cfg *config, counts tally, lim *adaptiveLimiter,
 	var lines []string
 
 	switch {
-	case listSize > 0 && listSize < cfg.threads:
+	case !cfg.loop && listSize > 0 && listSize < cfg.threads:
 		lines = append(lines, fmt.Sprintf(
-			"the list held %d names, so only %d workers ran however high -t was set. "+
-				"A name cannot be checked twice at once; to go faster you need more "+
-				"names, not more threads.", listSize, listSize))
+			"one pass over %d names can only use %d of your %d threads. Add -loop to "+
+				"keep re-checking, and every thread is used.", listSize, listSize, cfg.threads))
 	case cfg.noAdapt:
 		// The user asked for full throttle; nothing to say about the cap.
 	case cap < cfg.threads/2:
@@ -481,13 +480,19 @@ func printConfig(cfg *config, usernames []string, pool *proxyPool) {
 	row("Target", cWhite(fmt.Sprintf("%s (%d names)", cfg.usernamesFile, len(usernames))))
 	row("Threads", cCyan(fmt.Sprintf("%d", cfg.threads)))
 
-	// A thread with no name to check is not a thread. Starting 500 workers on a
-	// 24-name list gives 24 workers, and no setting changes that: the same name
-	// cannot be checked twice at once. Saying so here saves the user hunting for
-	// a throttle that is not happening.
+	// In a single pass a name is checked once, so a list shorter than the thread
+	// count leaves threads with nothing to do. While looping there is always
+	// more work - the list comes round again - so every thread is used and each
+	// name is simply checked more often.
 	if n := len(usernames); n > 0 && n < cfg.threads {
-		row("Workers", cYellow(fmt.Sprintf("%d - capped by the %d names in the list, not by -t %d",
-			n, n, cfg.threads)))
+		if cfg.loop {
+			per := cfg.threads / n
+			row("Watch", cCyan(fmt.Sprintf("%d names across %d threads (~%dx in flight each)",
+				n, cfg.threads, per)))
+		} else {
+			row("Workers", cYellow(fmt.Sprintf("%d - one pass over %d names uses %d threads; "+
+				"add -loop to keep all %d busy", n, n, n, cfg.threads)))
+		}
 	}
 	row("Proxies", proxies)
 	row("Timeout", cCyan(cfg.timeout.String()))
@@ -560,11 +565,7 @@ func printSummary(cfg *config, counts tally, elapsed time.Duration, interrupted 
 		// each attempt took about N*T/A. N is the concurrency that actually
 		// ran, which the list size caps - using -t here reported a 24-name run
 		// as if 500 requests had been in flight.
-		workers := cfg.threads
-		if listSize > 0 && listSize < workers {
-			workers = listSize
-		}
-		cap := effectiveConcurrency(lim, workers)
+		cap := effectiveConcurrency(lim, usefulConcurrency(cfg.threads, listSize, cfg.loop))
 		if attempts > 0 && cap > 0 {
 			per := time.Duration(float64(cap) * secs / float64(attempts) * float64(time.Second))
 			row("Latency", cCyan(fmt.Sprintf("~%v per request", per.Round(time.Millisecond))))
@@ -681,9 +682,9 @@ func runWorker(ctx context.Context, wl *worklist, results chan<- result,
 		}
 
 		if !validUsername(username) {
-			// Drop it from the list rather than rechecking a name that can
-			// never be valid on every pass forever.
-			wl.retire(username)
+			// Retirement is the writer's job, not this goroutine's: it is the
+			// single owner of the list's lifecycle, and doing it here raced
+			// with the writer's own check for stale results.
 			select {
 			case results <- result{username: username, status: statusInvalid}:
 			case <-ctx.Done():
@@ -693,12 +694,6 @@ func runWorker(ctx context.Context, wl *worklist, results chan<- result,
 		}
 
 		res := checkWithRetries(ctx, username, pool, cache, cfg, stats, lim)
-
-		// A name that came back available is finished with; the writer removes
-		// it from the list and the file. Anything else goes back into rotation.
-		if res.status != statusAvailable {
-			wl.release(username)
-		}
 
 		select {
 		case results <- res:
@@ -1015,7 +1010,7 @@ func runWriter(ctx context.Context, results <-chan result, cfg *config, con *con
 			Left:       left,
 			Counts:     counts,
 			Elapsed:    now.Sub(start),
-			Cus:        effectiveConcurrency(lim, usefulConcurrency(cfg.threads, left)),
+			Cus:        effectiveConcurrency(lim, usefulConcurrency(cfg.threads, left, cfg.loop)),
 			Threads:    cfg.threads,
 			ProxiesOK:  pool.healthy(),
 			ProxiesAll: pool.len(),
@@ -1034,12 +1029,27 @@ func runWriter(ctx context.Context, results <-chan result, cfg *config, con *con
 			if !ok {
 				return counts
 			}
+			// While looping, a name is in flight through several workers at
+			// once. When one of them finds it free the others are still on
+			// their way back with the same answer; those are stale. Dropping
+			// them here keeps one hit from being counted, logged and webhooked
+			// once per copy.
+			if wl.retiredName(res.username) {
+				continue
+			}
 			handleResult(res, cfg, con, &counts, record, sink.flushBucket, &whwg)
 
-			// A hit is retired here, while everything else keeps running: the
-			// name leaves the live list and the file in one place, with no
-			// pause and no rebuild.
-			if res.status == statusAvailable && !cfg.keepList {
+			// This goroutine is the single owner of the list's lifecycle, so
+			// retirement happens here and nowhere else.
+			switch {
+			case res.status == statusInvalid:
+				// A name that can never be valid must not be re-checked on
+				// every pass forever.
+				wl.retire(res.username)
+
+			case res.status == statusAvailable && !cfg.keepList:
+				// A hit leaves the live list and the file in one place, while
+				// everything else keeps running: no pause, no rebuild.
 				left := wl.retire(res.username)
 				if err := retireName(cfg, sink, res.username); err != nil {
 					warnf("cannot update %s: %v", cfg.usernamesFile, err)

@@ -268,36 +268,37 @@ every thread was busy and latency is the wall.
 `UPS` is `concurrency / latency`, so there are exactly two levers, and `CUS`
 tells you which one you are short of.
 
-**1. More names.** This is the one people miss. A name cannot be checked in two
-places at once — the second answer is the same as the first — so **the number of
-names in your list is a hard ceiling on concurrency**. Twenty-four names means
-twenty-four workers, whatever `-t` says, and the config panel tells you when this
-is happening:
+**1. More threads, with `-loop`.** The rate is `concurrency / latency`, and in
+loop mode concurrency is your thread count no matter how short the list is: each
+name is simply checked by several workers at once, which is what loop mode is
+for. Raise `-t` and turn off the automatic slowdown with `-no-adapt` (or the menu
+question) so the number you set is the number you get.
+
+Measured on a **20-name** list, changing nothing but the thread count:
+
+| threads | 20ms endpoint | 100ms endpoint |
+|---------|---------------|----------------|
+| 100 | 4 687 | 999 |
+| 500 | 21 699 | 4 912 |
+| 1 000 | 31 237 | 9 568 |
+
+The config panel shows how hard each name is being hit:
 
 ```
   Threads  : 500
-  Workers  : 24 - capped by the 24 names in the list, not by -t 500
+  Watch    : 20 names across 500 threads (~25x in flight each)
 ```
 
-Measured with 500 threads against a 20ms endpoint, changing nothing but the list:
+That is deliberate: a name that frees up is noticed in about a twenty-fifth of
+one round trip instead of a whole one. It is also harder on the endpoint, so if
+`unknown` starts climbing, lower `-t` or add `-delay`.
 
-| names in the list | requests/sec |
-|-------------------|--------------|
-| 24 | 1 098 |
-| 500 | 21 823 |
-| 5 000 | 21 518 |
+A **single pass** (no `-loop`) is the opposite case: a second check of the same
+name there spends a request to learn nothing, so a list shorter than `-t` leaves
+threads idle, and the tool says so rather than pretending otherwise.
 
-The arithmetic is `names in flight ÷ latency`. To sustain 5 000/sec through
-proxies that answer in 300ms you need about 1 500 names in flight, so the list
-has to hold at least that many.
-
-**2. More concurrency.** Raise `-t`, and turn off the automatic slowdown with
-`-no-adapt` (or the menu question) so the number you set is the number you get.
-This only helps once the list is bigger than your thread count.
-
-**3. Less latency.** Once the list is large enough and every thread is busy,
-this is the only lever left, and it is mostly your proxy list. Two settings
-matter here:
+**2. Less latency.** The other half of the equation, and mostly your proxy list.
+Two settings matter here:
 
 - **`-timeout`** — the default is `10s`, which means a hung proxy occupies a
   worker for ten full seconds before it is given up on. On a decent list
@@ -324,11 +325,9 @@ explains almost every slow run:
 - **`CUS` is far below `-t`** — the endpoint is throttling and the cap was cut.
   Watch `U` (unknown) and `PX`: if `PX` is dropping, proxies are being
   quarantined and you need better ones.
-- **`CUS` is a small number like `2`** — that is the list, not the tool. Workers
-  are capped at the number of names left, and in loop mode the list shrinks as
-  names are found. Two names left means two workers, and `RPS` will be tiny no
-  matter what `-t` says. This is correct: firing 500 threads at the same two
-  names would just get you blocked.
+- **`CUS` is small and you are not looping** — a single pass over a short list
+  can only use as many threads as it has names, because checking a name twice in
+  one pass learns nothing. Add `-loop` and every thread is used.
 
 `RPS` and `UPS` are averaged over a three second window, so they show the rate
 that is actually happening rather than flickering to zero whenever a single

@@ -24,9 +24,19 @@ import (
 // Here a single pool of workers pulls from this list continuously. Names that
 // come back available are retired from it while everything else keeps running.
 //
-// A name is handed to at most one worker at a time. Checking @foo in five
-// places at once returns the same answer five times, so it buys nothing and
-// spends five times the rate limit to get it.
+// While looping, the same name IS handed to several workers at once, and that
+// is the point rather than an oversight. Loop mode exists to notice the moment
+// a name frees up, and that moment arrives sooner the more often the name is
+// asked about. With 500 threads over 20 names each name is in flight about 25
+// times, so a name that frees is seen in about a twenty-fifth of one round
+// trip instead of one whole round trip.
+//
+// It is also the only way a short list can use a high thread count at all:
+// concurrency is what sets the request rate, and one-check-at-a-time would cap
+// a 20-name list at 20 concurrent checks no matter how -t was set.
+//
+// A single pass is different: there, checking a name twice really does spend
+// two requests to learn one fact, so each name is handed out exactly once.
 type worklist struct {
 	mu   sync.Mutex
 	cond *sync.Cond
@@ -36,7 +46,6 @@ type worklist struct {
 	// made a single-pass run hand out only part of the list and stop early.
 	names   []string
 	retired map[string]bool
-	busy    map[string]bool
 	live    int
 
 	cycle  bool // keep going round forever (loop mode)?
@@ -50,7 +59,6 @@ func newWorklist(names []string, cycle bool) *worklist {
 	w := &worklist{
 		names:   append([]string(nil), names...),
 		retired: make(map[string]bool),
-		busy:    make(map[string]bool),
 		live:    len(names),
 		cycle:   cycle,
 	}
@@ -58,67 +66,60 @@ func newWorklist(names []string, cycle bool) *worklist {
 	return w
 }
 
-// claim returns the next name that is not already being checked.
+// claim returns the next name to check.
 //
-// In cycling mode it blocks until one frees up, so a thread count larger than
-// the list parks the surplus workers instead of duplicating work. In
-// single-pass mode it returns false once every name has been handed out.
+// Cycling never blocks and never refuses a worker while any name is live: the
+// cursor just goes round, so every thread stays busy and the names share the
+// thread count between them. Single-pass hands each name out exactly once.
 func (w *worklist) claim(ctx context.Context) (string, bool) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
+	if w.closed || ctx.Err() != nil || w.live == 0 {
+		return "", false
+	}
+
 	if !w.cycle {
-		// One pass, one cursor, no waiting: every name is handed out at most
-		// once, so a worker that finds the cursor at the end is simply done.
+		// One pass, one cursor: a worker that finds the cursor at the end is
+		// simply done.
 		for w.next < len(w.names) {
-			if w.closed || ctx.Err() != nil {
-				return "", false
-			}
 			name := w.names[w.next]
 			w.next++
 			if w.retired[strings.ToLower(name)] {
 				continue
 			}
-			w.busy[name] = true
 			return name, true
 		}
 		return "", false
 	}
 
-	for {
-		if w.closed || ctx.Err() != nil || w.live == 0 {
-			return "", false
+	// Cycling. Skip past retired names; there is at least one live name or we
+	// would have returned above.
+	n := len(w.names)
+	for i := 0; i < n; i++ {
+		idx := (w.pos + i) % n
+		name := w.names[idx]
+		if w.retired[strings.ToLower(name)] {
+			continue
 		}
-
-		// Walk from the cursor to the first name nobody is checking.
-		n := len(w.names)
-		for i := 0; i < n; i++ {
-			idx := (w.pos + i) % n
-			name := w.names[idx]
-			if w.busy[name] || w.retired[strings.ToLower(name)] {
-				continue
-			}
-			w.busy[name] = true
-			w.pos = idx + 1
-			if w.pos >= n {
-				w.pos = 0
-				w.passes++
-			}
-			return name, true
+		w.pos = idx + 1
+		if w.pos >= n {
+			w.pos = 0
+			w.passes++
 		}
-
-		// Every live name is in flight. Wait for one to come back; release
-		// always broadcasts, and close() unblocks this on cancellation.
-		w.cond.Wait()
+		return name, true
 	}
+	return "", false
 }
 
-// release marks a name as no longer in flight, so it can be handed out again.
-func (w *worklist) release(name string) {
+// retiredName reports whether a name has already been retired. The writer uses
+// it to drop results for a name that was found while other copies of the same
+// check were still in flight - without it a single hit would be counted,
+// logged and webhooked once per copy.
+func (w *worklist) retiredName(name string) bool {
 	w.mu.Lock()
-	delete(w.busy, name)
-	w.mu.Unlock()
-	w.cond.Broadcast()
+	defer w.mu.Unlock()
+	return w.retired[strings.ToLower(name)]
 }
 
 // retire drops a name for good: it came back available, or it can never be
@@ -128,7 +129,6 @@ func (w *worklist) retire(name string) int {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	delete(w.busy, name)
 	key := strings.ToLower(name)
 	if !w.retired[key] {
 		w.retired[key] = true
@@ -194,15 +194,16 @@ func (w *worklist) close() {
 	w.cond.Broadcast()
 }
 
-// usefulConcurrency is how many checks can genuinely run at once: the thread
-// count, or the number of names if that is smaller.
+// usefulConcurrency is how many checks can genuinely run at once.
 //
-// This is not a limitation that can be configured away. Two workers on the same
-// name produce one fact between them, so a list of 24 names cannot keep 500
-// threads usefully busy however high -t is set. Reporting the honest number
-// beats showing 500 and leaving the user to wonder why the rate does not match.
-func usefulConcurrency(threads, listSize int) int {
-	if listSize > 0 && listSize < threads {
+// While looping, that is the full thread count however short the list is:
+// re-asking about the same name is what loop mode is for, so the names share
+// the threads between them rather than capping them.
+//
+// In a single pass it is bounded by the list, because there a second check of
+// the same name really would spend a request to learn nothing.
+func usefulConcurrency(threads, listSize int, loop bool) int {
+	if !loop && listSize > 0 && listSize < threads {
 		return listSize
 	}
 	return threads
