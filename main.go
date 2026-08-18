@@ -388,6 +388,11 @@ func main() {
 		fmt.Println(" " + label("Logs"))
 	}
 
+	if cfg.targetRPS > 0 && (pool.len() == 0 || cfg.noProxyCheck) {
+		warnf("-target needs the proxy test to measure latency; "+
+			"running with -t %d as given", cfg.threads)
+	}
+
 	cache := newClientCacheFor(cfg.timeout, cfg.threads).withHTTP2(cfg.http2)
 	defer cache.closeIdle()
 
@@ -560,6 +565,11 @@ func runInteractiveSetup(cfg *config) bool {
 		case "1":
 			fmt.Println()
 			cfg.threads = askInt("Threads:", cfg.threads)
+			// Offered here because working the thread count out from a latency
+			// percentile is arithmetic the tool can do, and because the menu is
+			// how this gets driven - a flag nobody sees is a flag nobody uses.
+			cfg.targetRPS = askInt("Or aim for requests/sec (0 = use the threads above):",
+				cfg.targetRPS)
 			// Offered here because it is the one setting that decides whether
 			// the thread count you just typed is a target or merely a ceiling.
 			cfg.noAdapt = askBool("Always run at full threads (no auto-slowdown)?", cfg.noAdapt)

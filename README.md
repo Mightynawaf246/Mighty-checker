@@ -76,6 +76,13 @@ Run the tool with no flags and it shows a menu, then asks for settings:
   4  Quit
 
   choice: [1] 1
+
+  Threads: [10] 500
+  Or aim for requests/sec (0 = use the threads above): [0] 5000
+  Always run at full threads (no auto-slowdown)? [y/N] n
+  Loop forever (keep re-checking)? [y/N] y
+
+  choice: [1] 1
   Threads: [10] 100
   Loop forever (keep re-checking)? [y/N] y
   Delay between requests: [0s] 200ms
@@ -158,6 +165,9 @@ Throughput is `concurrency / latency`. Latency is your proxies and cannot be
 argued with; concurrency is the one term you control. So the thread count that
 reaches a given rate is arithmetic, and the pre-flight has just measured the one
 unknown in it — no reason to do it by hand:
+
+From the menu, answer the *"Or aim for requests/sec"* question with your number.
+Or on the command line:
 
 ```
 mighty.exe -target 5000 -loop
