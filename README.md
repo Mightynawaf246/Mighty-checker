@@ -98,6 +98,8 @@ every proxy gets one real request through it and the result is reported:
   Alive    : 431 (86%)
   Dead     : 69
   Latency  : p50 180ms   p90 420ms   p99 1.2s
+  Split    : reaching the proxy ~55ms  +  Instagram answering ~125ms
+  Floor    : ~125ms - a closer proxy cannot go below what the endpoint itself takes
   Expect   : ~2778 req/sec at -t 500
   For 5k   : -t 900, or proxies faster than 100ms
   For 10k  : -t 1800, or proxies faster than 50ms
@@ -112,6 +114,11 @@ Three things come out of this:
 
 - **You find out immediately**, with a cause per proxy, instead of watching a
   slow run full of unexplained errors. Passwords are masked in every line.
+- **The split says whether faster proxies would even help.** The round trip is
+  the time to reach your proxy and for it to reach Instagram's edge, plus the
+  time Instagram takes to answer. Only the first half is something you can buy;
+  the second is a floor. If `Floor` is most of your latency, a closer proxy
+  changes almost nothing and the lever is `-t` instead.
 - **The measured latency predicts your rate.** Throughput is
   `concurrency / latency`, and this is the first moment both numbers are known,
   so the tool does the arithmetic and tells you the `-t` your target needs.

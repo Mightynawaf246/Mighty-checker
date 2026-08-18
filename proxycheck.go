@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"net/http/httptrace"
 	"os"
 	"sort"
 	"strings"
@@ -25,6 +26,20 @@ type proxyReport struct {
 	rtt    time.Duration
 	code   int
 	reason string
+
+	// The round trip split into the part you can buy your way out of and the
+	// part you cannot.
+	//
+	// connect is everything up to having a usable connection: reaching the
+	// proxy, and the proxy reaching Instagram's edge and completing TLS. A
+	// closer or better-peered proxy reduces this.
+	//
+	// serve is from the request being written to the first byte coming back:
+	// Instagram's own processing plus one edge round trip. No proxy purchase
+	// changes it, and it is usually the larger half - which is why a "5ms
+	// proxy" cannot produce a 5ms check.
+	connect time.Duration
+	serve   time.Duration
 }
 
 // checkProxies tests every proxy in the pool against the real endpoint and
@@ -142,9 +157,26 @@ func testProxy(ctx context.Context, p *proxySpec, cache *clientCache, timeout ti
 	rctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
+	// Time the phases separately. "How do I get faster proxies" is answerable
+	// only once you know which half of the round trip is the proxy's and which
+	// half belongs to the endpoint.
+	var gotConn, wroteReq, firstByte time.Time
+	rctx = httptrace.WithClientTrace(rctx, &httptrace.ClientTrace{
+		GotConn:              func(httptrace.GotConnInfo) { gotConn = time.Now() },
+		WroteRequest:         func(httptrace.WroteRequestInfo) { wroteReq = time.Now() },
+		GotFirstResponseByte: func() { firstByte = time.Now() },
+	})
+
 	start := time.Now()
 	resp, err := checkOnce(rctx, client, randomString(12))
 	rep.rtt = time.Since(start)
+
+	if !gotConn.IsZero() {
+		rep.connect = gotConn.Sub(start)
+	}
+	if !wroteReq.IsZero() && !firstByte.IsZero() && firstByte.After(wroteReq) {
+		rep.serve = firstByte.Sub(wroteReq)
+	}
 
 	if err != nil {
 		rep.reason = classifyError(err)
@@ -175,7 +207,7 @@ func printProxyReport(cfg *config, reports []proxyReport) (alive int) {
 		return 0
 	}
 
-	var rtts []time.Duration
+	var rtts, connects, serves []time.Duration
 	reasons := map[string]int{}
 	var dead []proxyReport
 	untested := 0
@@ -188,6 +220,12 @@ func printProxyReport(cfg *config, reports []proxyReport) (alive int) {
 		if r.ok {
 			alive++
 			rtts = append(rtts, r.rtt)
+			if r.connect > 0 {
+				connects = append(connects, r.connect)
+			}
+			if r.serve > 0 {
+				serves = append(serves, r.serve)
+			}
 			continue
 		}
 		reason := r.reason
@@ -233,6 +271,19 @@ func printProxyReport(cfg *config, reports []proxyReport) (alive int) {
 			pctl(rtts, 50).Round(time.Millisecond),
 			pctl(rtts, 90).Round(time.Millisecond),
 			pctl(rtts, 99).Round(time.Millisecond))))
+
+		// Where the time actually goes. Buying "faster proxies" only moves the
+		// connect half; the endpoint half is a floor no purchase gets under.
+		if len(connects) > 0 && len(serves) > 0 {
+			sort.Slice(connects, func(i, j int) bool { return connects[i] < connects[j] })
+			sort.Slice(serves, func(i, j int) bool { return serves[i] < serves[j] })
+			c, sv := pctl(connects, 50), pctl(serves, 50)
+			row("Split", cWhite(fmt.Sprintf("reaching the proxy ~%v  +  Instagram answering ~%v",
+				c.Round(time.Millisecond), sv.Round(time.Millisecond))))
+			row("Floor", cGray(fmt.Sprintf(
+				"~%v - a closer proxy cannot go below what the endpoint itself takes",
+				sv.Round(time.Millisecond))))
+		}
 
 		// Throughput is concurrency divided by latency, and this is the first
 		// point in the run where both numbers are known. Saying so here saves

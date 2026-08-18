@@ -2,6 +2,9 @@ package main
 
 import (
 	"context"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -230,5 +233,33 @@ func TestPruneWithNothingProvenDeadIsANoop(t *testing.T) {
 	raw, _ := os.ReadFile(path)
 	if string(raw) != content {
 		t.Errorf("the file was rewritten for no reason:\n got %q\nwant %q", string(raw), content)
+	}
+}
+
+// "How do I get faster proxies" is answerable only once you know which half of
+// the round trip belongs to the proxy and which to the endpoint. Prove the
+// split attributes the time correctly: a slow endpoint on a local connection
+// must show up entirely as serve, not connect.
+func TestLatencySplitAttribution(t *testing.T) {
+	const serverThink = 150 * time.Millisecond
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(serverThink)
+		fmt.Fprint(w, bodyTaken)
+	}))
+	t.Cleanup(srv.Close)
+	withEndpoint(t, srv.URL)
+
+	rep := testProxy(context.Background(), nil, newClientCacheFor(5*time.Second, 4), 5*time.Second)
+	if !rep.ok {
+		t.Fatalf("expected a clean answer, got %q", rep.reason)
+	}
+	if rep.serve < serverThink {
+		t.Errorf("serve = %v, should account for the endpoint's %v", rep.serve, serverThink)
+	}
+	if rep.connect > 50*time.Millisecond {
+		t.Errorf("connect = %v, a local connection should be near zero", rep.connect)
+	}
+	if rep.connect+rep.serve > rep.rtt+10*time.Millisecond {
+		t.Errorf("the parts (%v + %v) exceed the whole (%v)", rep.connect, rep.serve, rep.rtt)
 	}
 }
