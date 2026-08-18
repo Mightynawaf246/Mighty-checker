@@ -661,6 +661,33 @@ that is actually happening rather than flickering to zero whenever a single
 | `-no-update-check` | skip the startup update check | — |
 | `-quiet` | suppress all console output | — |
 
+## Where updates come from
+
+`-update` downloads a source tree, compiles it, and replaces the running binary
+with the result. That makes the update source the most security-sensitive
+setting in the tool, so it is not a setting at all: the owner, repository and
+branch are **compile-time constants**, and nothing in the environment can change
+them.
+
+They used to be `MIGHTY_UPDATE_OWNER` / `_REPO` / `_BRANCH`, so a fork could
+point the updater at itself. That was full remote code execution: anything able
+to set an environment variable — a batch file, a shortcut, a shared "helper
+script", a modified profile — could make the tool build and install code of its
+choosing. Forks now change the constants and rebuild, which is a code change
+under review rather than a value read from a hostile environment.
+
+Three checks back that up:
+
+- every update URL is verified before the request goes out — https, a GitHub
+  host, and the exact `owner/repo` path;
+- redirects are refused if they leave GitHub, so the token is never sent
+  elsewhere and no payload is accepted from elsewhere;
+- the download is size-capped, and the freshly built binary is run once to
+  prove it works before it replaces the one that already does.
+
+`MIGHTY_UPDATE_TOKEN` still works — it is a credential, not a source, and with
+the source pinned it can only ever be sent to `api.github.com`.
+
 ## Self-update
 
 Instead of re-downloading the source every time, the tool updates itself:

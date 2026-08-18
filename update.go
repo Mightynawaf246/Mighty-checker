@@ -18,13 +18,41 @@ import (
 	"time"
 )
 
-// Update source settings. Overridable via environment variables for forks.
-var (
-	updateOwner  = envOr("MIGHTY_UPDATE_OWNER", "Mightynawaf246")
-	updateRepo   = envOr("MIGHTY_UPDATE_REPO", "mighty-checker")
-	updateBranch = envOr("MIGHTY_UPDATE_BRANCH", "main")
-	updateSubdir = "" // the tool lives at the repository root
+// The update source. Deliberately constants, and deliberately not
+// configurable at runtime.
+//
+// These were environment variables so a fork could point the updater at itself.
+// That is a full remote-code-execution hole: -update downloads a source tree,
+// compiles it, and replaces the running binary with the result, so anything
+// that can set MIGHTY_UPDATE_OWNER can make the tool build and install code of
+// its choosing. A batch file, a shortcut, a shared "helper script", or a
+// modified profile is enough. Nothing about updating from a public repository
+// requires that flexibility, so it is gone: the source is this repository, and
+// only this repository.
+//
+// Forks change these here and rebuild, which is a code change under review
+// rather than a value read from a hostile environment.
+const (
+	updateOwner  = "Mightynawaf246"
+	updateRepo   = "mighty-checker"
+	updateBranch = "main"
 )
+
+// updateSubdir is where the tool sits inside that repository. Not a constant
+// only because the tests exercise both the root and subdirectory layouts; it
+// addresses a path INSIDE the pinned repository, so it cannot redirect the
+// source anywhere - a wrong value simply fails to find go.mod.
+var updateSubdir = "" // the tool lives at the repository root
+
+// updateHosts are the only hosts the updater will talk to or be redirected to.
+// api.github.com serves the metadata; codeload.github.com is where the tarball
+// download is redirected.
+var updateHosts = map[string]bool{
+	"api.github.com":                true,
+	"codeload.github.com":           true,
+	"github.com":                    true,
+	"objects.githubusercontent.com": true,
+}
 
 const (
 	// downloadTimeout covers the network work only.
@@ -36,6 +64,9 @@ const (
 
 	// maxEntryBytes caps a single file extracted from the archive.
 	maxEntryBytes = 64 << 20
+
+	// maxArchiveBytes caps the whole download.
+	maxArchiveBytes = 256 << 20
 )
 
 func envOr(key, def string) string {
@@ -55,7 +86,49 @@ func updateToken() string {
 	return ""
 }
 
+// updateClient refuses to leave GitHub, including through a redirect.
+//
+// A redirect is an instruction from the server about where to go next. The
+// updater carries a credential and installs whatever it downloads, so it must
+// not follow that instruction anywhere it did not already intend to go.
+var updateClient = &http.Client{
+	CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		if len(via) >= 10 {
+			return fmt.Errorf("too many redirects")
+		}
+		if req.URL.Scheme != "https" || !updateHosts[req.URL.Hostname()] {
+			return fmt.Errorf("refusing to follow a redirect off GitHub: %s", req.URL.Host)
+		}
+		return nil
+	},
+}
+
+// verifyUpdateURL is the last check before any update request goes out: the
+// scheme, the host, and the repository path must all be the expected ones. Even
+// with the source pinned to constants, this refuses to send the token or accept
+// a payload from anywhere else.
+func verifyUpdateURL(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("bad update url: %w", err)
+	}
+	if u.Scheme != "https" {
+		return fmt.Errorf("update url must be https, got %q", u.Scheme)
+	}
+	if !updateHosts[u.Hostname()] {
+		return fmt.Errorf("update url host %q is not GitHub", u.Hostname())
+	}
+	want := "/repos/" + updateOwner + "/" + updateRepo + "/"
+	if !strings.HasPrefix(u.Path, want) {
+		return fmt.Errorf("update url does not address %s/%s", updateOwner, updateRepo)
+	}
+	return nil
+}
+
 func ghGet(ctx context.Context, u, accept string) (*http.Response, error) {
+	if err := verifyUpdateURL(u); err != nil {
+		return nil, err
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return nil, err
@@ -68,7 +141,7 @@ func ghGet(ctx context.Context, u, accept string) (*http.Response, error) {
 	if t := updateToken(); t != "" {
 		req.Header.Set("Authorization", "Bearer "+t)
 	}
-	return http.DefaultClient.Do(req)
+	return updateClient.Do(req)
 }
 
 // contentPath joins updateSubdir with a file name. updateSubdir is empty when
@@ -98,7 +171,7 @@ func fetchRemoteVersion(ctx context.Context) (string, error) {
 		hint := ""
 		switch resp.StatusCode {
 		case http.StatusNotFound:
-			hint = "\n  the repo/branch may be wrong, private (set MIGHTY_UPDATE_TOKEN)," +
+			hint = "\n  the repository may be private (set MIGHTY_UPDATE_TOKEN)," +
 				"\n  or your network is blocking api.github.com"
 		case http.StatusForbidden, http.StatusTooManyRequests:
 			hint = "\n  GitHub rate limit reached (60/hour unauthenticated)." +
@@ -157,9 +230,17 @@ func downloadTarball(ctx context.Context, dir string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if _, err := io.Copy(f, resp.Body); err != nil {
+	// Bounded. The source is pinned to one repository, but a download with no
+	// ceiling is still a way to fill a disk, and a truncated archive must be an
+	// error rather than something that gets extracted and compiled.
+	n, err := io.CopyN(f, resp.Body, maxArchiveBytes)
+	if err != nil && err != io.EOF {
 		f.Close()
 		return "", err
+	}
+	if n >= maxArchiveBytes {
+		f.Close()
+		return "", fmt.Errorf("source archive exceeds the %d byte limit", int64(maxArchiveBytes))
 	}
 	if err := f.Close(); err != nil {
 		return "", err

@@ -4,6 +4,8 @@ import (
 	"archive/tar"
 	"bytes"
 	"compress/gzip"
+	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -182,5 +184,86 @@ func TestContentPath(t *testing.T) {
 	updateSubdir = "instagram-username-checker"
 	if got := contentPath("VERSION"); got != "instagram-username-checker/VERSION" {
 		t.Errorf("subdir layout: got %q", got)
+	}
+}
+
+// -update downloads a source tree, compiles it, and replaces the running
+// binary with the result. The source it pulls from must therefore not be
+// something the environment can change: MIGHTY_UPDATE_OWNER and friends turned
+// three environment variables into full code execution, and anything able to
+// set one - a batch file, a shortcut, a shared helper script, a modified
+// profile - could make the tool build and install code of its choosing.
+func TestUpdateSourceCannotBeRedirected(t *testing.T) {
+	for _, k := range []string{"MIGHTY_UPDATE_OWNER", "MIGHTY_UPDATE_REPO", "MIGHTY_UPDATE_BRANCH"} {
+		t.Setenv(k, "attacker-controlled")
+	}
+	if updateOwner != "Mightynawaf246" || updateRepo != "mighty-checker" || updateBranch != "main" {
+		t.Fatalf("the environment redirected the update source to %s/%s@%s",
+			updateOwner, updateRepo, updateBranch)
+	}
+}
+
+// Every update request is checked before it goes out, so the token is never
+// sent anywhere but GitHub and no payload is accepted from anywhere else.
+func TestUpdateURLsAreVerified(t *testing.T) {
+	ok := []string{
+		"https://api.github.com/repos/Mightynawaf246/mighty-checker/contents/VERSION?ref=main",
+		"https://api.github.com/repos/Mightynawaf246/mighty-checker/tarball/main",
+	}
+	for _, u := range ok {
+		if err := verifyUpdateURL(u); err != nil {
+			t.Errorf("rejected a legitimate url %q: %v", u, err)
+		}
+	}
+
+	bad := map[string]string{
+		"http://api.github.com/repos/Mightynawaf246/mighty-checker/tarball/main":    "plain http",
+		"https://evil.example.com/repos/Mightynawaf246/mighty-checker/tarball/main": "wrong host",
+		"https://api.github.com/repos/attacker/evil/tarball/main":                   "wrong repo",
+		"https://api.github.com/repos/Mightynawaf246/other-repo/tarball/main":       "wrong repo name",
+		"https://api.github.com.evil.com/repos/Mightynawaf246/mighty-checker/x":     "lookalike host",
+		"://not a url": "unparseable",
+	}
+	for u, why := range bad {
+		if err := verifyUpdateURL(u); err == nil {
+			t.Errorf("accepted %s: %q", why, u)
+		}
+	}
+}
+
+// A redirect is the server telling the client where to go next. The updater
+// carries a credential and installs what it downloads, so it must not follow
+// that instruction off GitHub.
+func TestUpdateClientRefusesRedirectsOffGitHub(t *testing.T) {
+	check := updateClient.CheckRedirect
+	if check == nil {
+		t.Fatal("the update client follows redirects unconditionally")
+	}
+
+	mk := func(raw string) *http.Request {
+		u, err := url.Parse(raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return &http.Request{URL: u}
+	}
+
+	if err := check(mk("https://codeload.github.com/Mightynawaf246/mighty-checker/legacy.tar.gz/main"), nil); err != nil {
+		t.Errorf("refused GitHub's own download host: %v", err)
+	}
+	for _, bad := range []string{
+		"https://evil.example.com/payload.tar.gz",
+		"http://codeload.github.com/x",
+		"https://github.com.evil.com/x",
+	} {
+		if err := check(mk(bad), nil); err == nil {
+			t.Errorf("followed a redirect to %s", bad)
+		}
+	}
+
+	// And it must not loop forever.
+	via := make([]*http.Request, 10)
+	if err := check(mk("https://api.github.com/repos/Mightynawaf246/mighty-checker/x"), via); err == nil {
+		t.Error("no redirect limit")
 	}
 }
