@@ -69,7 +69,7 @@ side you are on.
 Run the tool with no flags and it shows a menu, then asks for settings:
 
 ```
- [ Mighty Menu ] v1.6.0
+ [ Mighty Menu ]
   1  Start checking
   2  Test my proxies        <- how many are alive, and how fast
   3  Check for updates      <- the update button
@@ -81,11 +81,7 @@ Run the tool with no flags and it shows a menu, then asks for settings:
   Or aim for requests/sec (0 = use the threads above): [0] 5000
   Always run at full threads (no auto-slowdown)? [y/N] n
   Loop forever (keep re-checking)? [y/N] y
-
-  choice: [1] 1
-  Threads: [10] 100
-  Loop forever (keep re-checking)? [y/N] y
-  Delay between requests: [0s] 200ms
+  Delay between requests: [0s] 0s
 ```
 
 Passing any flag (for example `-t 50`) skips the menu and starts immediately,
