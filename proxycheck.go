@@ -7,12 +7,20 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
 // proxyReport is what one proxy did when tested.
 type proxyReport struct {
-	spec   *proxySpec
+	spec *proxySpec
+
+	// tested distinguishes "this proxy answered nothing" from "this proxy was
+	// never asked". A cancelled pre-flight leaves the untested entries at their
+	// zero value, and treating those as failures let -prune-proxies delete a
+	// whole list of perfectly good proxies on a Ctrl-C.
+	tested bool
+
 	ok     bool
 	rtt    time.Duration
 	code   int
@@ -61,7 +69,7 @@ func checkProxies(ctx context.Context, pool *proxyPool, cache *clientCache,
 	}
 
 	reports := make([]proxyReport, len(specs))
-	var done, alive atomic64Pair
+	var done, alive atomic.Int64
 
 	jobs := make(chan int)
 	var wg sync.WaitGroup
@@ -72,7 +80,7 @@ func checkProxies(ctx context.Context, pool *proxyPool, cache *clientCache,
 			for idx := range jobs {
 				reports[idx] = testProxy(ctx, specs[idx], cache, timeout)
 				if reports[idx].ok {
-					alive.add(1)
+					alive.Add(1)
 					// Feed the measurement into the pool so the run starts with
 					// a calibrated view of which proxies are fast.
 					pool.markOK(specs[idx], reports[idx].rtt)
@@ -83,11 +91,11 @@ func checkProxies(ctx context.Context, pool *proxyPool, cache *clientCache,
 						pool.markFail(specs[idx])
 					}
 				}
-				n := done.add(1)
+				n := done.Add(1)
 				if con != nil {
 					con.status(fmt.Sprintf("  %s %s",
 						cGray("testing proxies..."),
-						cCyan(fmt.Sprintf("%d/%d  %d alive", n, len(specs), alive.get()))))
+						cCyan(fmt.Sprintf("%d/%d  %d alive", n, len(specs), alive.Load()))))
 				}
 			}
 		}()
@@ -99,6 +107,9 @@ func checkProxies(ctx context.Context, pool *proxyPool, cache *clientCache,
 		case <-ctx.Done():
 			close(jobs)
 			wg.Wait()
+			if con != nil {
+				con.clearStatus()
+			}
 			return reports
 		}
 	}
@@ -120,7 +131,7 @@ const proxyCheckTimeout = 8 * time.Second
 // is whether a request through it comes back as something the classifier can
 // read, which is exactly what the run will need from it.
 func testProxy(ctx context.Context, p *proxySpec, cache *clientCache, timeout time.Duration) proxyReport {
-	rep := proxyReport{spec: p}
+	rep := proxyReport{spec: p, tested: true}
 
 	client, err := cache.clientFor(p)
 	if err != nil {
@@ -167,8 +178,13 @@ func printProxyReport(cfg *config, reports []proxyReport) (alive int) {
 	var rtts []time.Duration
 	reasons := map[string]int{}
 	var dead []proxyReport
+	untested := 0
 
 	for _, r := range reports {
+		if !r.tested {
+			untested++
+			continue
+		}
 		if r.ok {
 			alive++
 			rtts = append(rtts, r.rtt)
@@ -188,8 +204,15 @@ func printProxyReport(cfg *config, reports []proxyReport) (alive int) {
 		fmt.Printf("  %s %s\n", cGray(fmt.Sprintf("%-9s:", k)), v)
 	}
 
-	total := len(reports)
+	total := len(reports) - untested
+	if total <= 0 {
+		row("Tested", cYellow("0 - the test was interrupted"))
+		return 0
+	}
 	row("Tested", cWhite(fmt.Sprintf("%d", total)))
+	if untested > 0 {
+		row("Skipped", cYellow(fmt.Sprintf("%d - the test was interrupted", untested)))
+	}
 
 	pct := alive * 100 / total
 	aliveText := cGreen(fmt.Sprintf("%d (%d%%)", alive, pct))
@@ -274,14 +297,28 @@ func pctl(sorted []time.Duration, p int) time.Duration {
 	return sorted[i]
 }
 
-// pruneProxies rewrites the proxies file with only the ones that answered,
-// preserving comments and the original order.
+// pruneProxies removes the proxies that were tested and failed, preserving
+// comments, order and permissions.
+//
+// Only proxies PROVEN dead are removed. A proxy that was never tested - because
+// the pre-flight was interrupted - is kept: the alternative deleted whole lists
+// of working, paid proxies on a Ctrl-C.
 func pruneProxies(path string, reports []proxyReport) (kept int, err error) {
-	live := make(map[string]bool, len(reports))
+	failed := make(map[string]bool, len(reports))
 	for _, r := range reports {
-		if r.ok {
-			live[r.spec.key()] = true
+		if r.tested && !r.ok && r.spec != nil {
+			failed[r.spec.key()] = true
 		}
+	}
+	if len(failed) == 0 {
+		// Nothing was proven dead, so there is nothing to do. Rewriting the
+		// file here could only lose something. Report what the file holds, not
+		// what was tested, so the message cannot contradict the file.
+		existing, err := loadProxies(path)
+		if err != nil {
+			return 0, err
+		}
+		return len(existing), nil
 	}
 
 	raw, err := os.ReadFile(path)
@@ -305,7 +342,7 @@ func pruneProxies(path string, reports []proxyReport) (kept int, err error) {
 			// Unparseable lines were never usable; drop them too.
 			continue
 		}
-		if live[spec.key()] {
+		if !failed[spec.key()] {
 			out = append(out, line)
 			kept++
 		}
@@ -327,23 +364,4 @@ func pruneProxies(path string, reports []proxyReport) (kept int, err error) {
 		return 0, err
 	}
 	return kept, nil
-}
-
-// atomic64Pair is a tiny counter pair used only by the pre-flight display.
-type atomic64Pair struct {
-	mu sync.Mutex
-	n  int
-}
-
-func (a *atomic64Pair) add(d int) int {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	a.n += d
-	return a.n
-}
-
-func (a *atomic64Pair) get() int {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	return a.n
 }

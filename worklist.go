@@ -38,8 +38,7 @@ import (
 // A single pass is different: there, checking a name twice really does spend
 // two requests to learn one fact, so each name is handed out exactly once.
 type worklist struct {
-	mu   sync.Mutex
-	cond *sync.Cond
+	mu sync.Mutex
 
 	// names is fixed for the life of a pass. Retiring a name marks it rather
 	// than deleting it: shrinking this slice moves every cursor into it, which
@@ -62,7 +61,6 @@ func newWorklist(names []string, cycle bool) *worklist {
 		live:    len(names),
 		cycle:   cycle,
 	}
-	w.cond = sync.NewCond(&w.mu)
 	return w
 }
 
@@ -136,7 +134,6 @@ func (w *worklist) retire(name string) int {
 			w.live--
 		}
 	}
-	w.cond.Broadcast()
 	return w.live
 }
 
@@ -156,7 +153,6 @@ func (w *worklist) replace(names []string) {
 	if w.pos >= len(w.names) {
 		w.pos = 0
 	}
-	w.cond.Broadcast()
 }
 
 // size reports how many names are still being watched.
@@ -191,7 +187,6 @@ func (w *worklist) close() {
 	w.mu.Lock()
 	w.closed = true
 	w.mu.Unlock()
-	w.cond.Broadcast()
 }
 
 // usefulConcurrency is how many checks can genuinely run at once.

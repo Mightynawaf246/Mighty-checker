@@ -1110,11 +1110,20 @@ func runWriter(ctx context.Context, results <-chan result, cfg *config, con *con
 				// every pass forever.
 				wl.retire(res.username)
 
-			case res.status == statusAvailable && !cfg.keepList:
-				// A hit leaves the live list and the file in one place, while
-				// everything else keeps running: no pause, no rebuild.
+			case res.status == statusAvailable:
+				// The name is answered, so it always leaves the live rotation -
+				// including under -keep-list, which is about the FILE and
+				// nothing else. Leaving it in rotation meant a single hit was
+				// re-found by every worker still carrying it, and with copies
+				// of one name in flight that is not a duplicate here and there:
+				// measured at 20 threads it counted one hit sixteen thousand
+				// times in under a second, logging and webhooking each one.
 				left := wl.retire(res.username)
-				if err := retireName(cfg, sink, res.username); err != nil {
+
+				if cfg.keepList {
+					con.log(cGreen(fmt.Sprintf("  + @%s recorded", res.username)) +
+						cGray(fmt.Sprintf("  - %d left (list kept)", left)))
+				} else if err := retireName(cfg, sink, res.username); err != nil {
 					warnf("cannot update %s: %v", cfg.usernamesFile, err)
 				} else {
 					con.log(cGreen(fmt.Sprintf("  + moved @%s to available.txt", res.username)) +

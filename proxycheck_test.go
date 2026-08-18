@@ -96,12 +96,14 @@ func TestPruneProxiesKeepsOnlyWorkingOnes(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// tested:true matters - an untested report means "never asked", and those
+	// are deliberately kept.
 	mk := func(u string, ok bool) proxyReport {
 		s, err := parseProxy(u)
 		if err != nil {
 			t.Fatal(err)
 		}
-		return proxyReport{spec: s, ok: ok}
+		return proxyReport{spec: s, tested: true, ok: ok}
 	}
 	reports := []proxyReport{
 		mk("http://1.1.1.1:8080", true),
@@ -163,5 +165,70 @@ func TestPercentile(t *testing.T) {
 	}
 	if got := pctl(nil, 50); got != 0 {
 		t.Errorf("empty = %v", got)
+	}
+}
+
+// An interrupted pre-flight leaves untested entries. Pruning on that must not
+// delete them: they are proxies nobody asked about, not proxies that failed.
+// Doing so wiped entire paid proxy lists on a Ctrl-C.
+func TestPruneKeepsUntestedProxies(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "proxies.txt")
+	content := "# keep me\nhttp://1.1.1.1:8080\nhttp://2.2.2.2:8080\nhttp://3.3.3.3:8080\n"
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	spec := func(u string) *proxySpec {
+		s, err := parseProxy(u)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return s
+	}
+	reports := []proxyReport{
+		{spec: spec("http://1.1.1.1:8080"), tested: true, ok: true},  // alive
+		{spec: spec("http://2.2.2.2:8080"), tested: true, ok: false}, // proven dead
+		{}, // never tested
+	}
+
+	if _, err := pruneProxies(path, reports); err != nil {
+		t.Fatalf("pruneProxies: %v", err)
+	}
+	raw, _ := os.ReadFile(path)
+	got := string(raw)
+
+	if !strings.Contains(got, "1.1.1.1") {
+		t.Errorf("the working proxy was deleted: %q", got)
+	}
+	if strings.Contains(got, "2.2.2.2") {
+		t.Errorf("the proven-dead proxy survived: %q", got)
+	}
+	if !strings.Contains(got, "3.3.3.3") {
+		t.Errorf("an untested proxy was deleted: %q", got)
+	}
+	if !strings.Contains(got, "# keep me") {
+		t.Errorf("comment lost: %q", got)
+	}
+}
+
+// With nothing proven dead, the file must not be rewritten at all, and the
+// count reported must describe the file rather than the tested set.
+func TestPruneWithNothingProvenDeadIsANoop(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "proxies.txt")
+	content := "# mine\nhttp://1.1.1.1:8080\nhttp://2.2.2.2:8080\n"
+	os.WriteFile(path, []byte(content), 0o600)
+
+	kept, err := pruneProxies(path, []proxyReport{{}, {}})
+	if err != nil {
+		t.Fatalf("pruneProxies: %v", err)
+	}
+	if kept != 2 {
+		t.Errorf("kept = %d, want the 2 proxies the file holds", kept)
+	}
+	raw, _ := os.ReadFile(path)
+	if string(raw) != content {
+		t.Errorf("the file was rewritten for no reason:\n got %q\nwant %q", string(raw), content)
 	}
 }

@@ -636,3 +636,83 @@ func TestAdaptiveLimiterGrowsGeometricallyWhenLow(t *testing.T) {
 		t.Errorf("below the ceiling growth must be geometric: 100 -> %d, want 150", got)
 	}
 }
+
+// -keep-list is about the FILE and nothing else. Leaving a found name in the
+// live rotation meant every worker still carrying it re-found it, and with
+// copies of one name in flight that is not the odd duplicate: measured at 20
+// threads, a single hit was counted, logged and webhooked 16,237 times in under
+// a second.
+func TestKeepListDoesNotRepeatAHit(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, bodyAvailable)
+	}))
+	t.Cleanup(srv.Close)
+	withEndpoint(t, srv.URL)
+
+	dir := t.TempDir()
+	listPath := filepath.Join(dir, "username.txt")
+	if err := os.WriteFile(listPath, []byte("onlyname\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config{threads: 20, timeout: 5 * time.Second, retries: 1,
+		outDir: dir, quiet: true, loop: true, keepList: true, usernamesFile: listPath}
+
+	wl := newWorklist([]string{"onlyname"}, true)
+	sink := newResultSink(cfg)
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+
+	counts := runPipeline(ctx, wl, newProxyPool(nil),
+		newClientCacheFor(cfg.timeout, cfg.threads), cfg, sink, &liveStats{},
+		newAdaptiveLimiter(cfg.threads, true), time.Now())
+	sink.close()
+
+	if counts.available != 1 {
+		t.Errorf("one hit was counted %d times", counts.available)
+	}
+	// The file, which is what -keep-list is about, must be untouched.
+	left, err := loadLines(listPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(left) != 1 || left[0] != "onlyname" {
+		t.Errorf("-keep-list must leave the usernames file alone, got %v", left)
+	}
+}
+
+// Without -keep-list the same hit leaves both the rotation and the file.
+func TestFoundNameLeavesRotationAndFile(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, bodyAvailable)
+	}))
+	t.Cleanup(srv.Close)
+	withEndpoint(t, srv.URL)
+
+	dir := t.TempDir()
+	listPath := filepath.Join(dir, "username.txt")
+	os.WriteFile(listPath, []byte("onlyname\n"), 0o644)
+	cfg := &config{threads: 20, timeout: 5 * time.Second, retries: 1,
+		outDir: dir, quiet: true, loop: true, usernamesFile: listPath}
+
+	wl := newWorklist([]string{"onlyname"}, true)
+	sink := newResultSink(cfg)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	counts := runPipeline(ctx, wl, newProxyPool(nil),
+		newClientCacheFor(cfg.timeout, cfg.threads), cfg, sink, &liveStats{},
+		newAdaptiveLimiter(cfg.threads, true), time.Now())
+	sink.close()
+
+	if counts.available != 1 {
+		t.Errorf("one hit was counted %d times", counts.available)
+	}
+	if left, _ := loadLines(listPath); len(left) != 0 {
+		t.Errorf("the found name should have left the file, got %v", left)
+	}
+	// The list emptied, so the run must have ended on its own rather than on
+	// the context deadline.
+	if ctx.Err() != nil {
+		t.Error("the run did not stop when the list emptied")
+	}
+}

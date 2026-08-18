@@ -130,7 +130,7 @@ That needs no username list, so it works before your list is even ready.
 | Flag | Effect |
 |------|--------|
 | `-check-proxies` | run the test, print the report, exit |
-| `-prune-proxies` | delete the failed proxies from `proxies.txt` (comments kept) |
+| `-prune-proxies` | delete the proxies that were tested and failed (comments kept; anything not tested is left alone) |
 | `-no-proxy-check` | skip the pre-flight |
 
 ## Continuous checking (no rounds)
@@ -175,7 +175,9 @@ is re-read every round, so you can add names while the tool is running. Result
 files stay open across rounds, so earlier results are never wiped and no name is
 written twice.
 
-Pass `-keep-list` if you would rather leave the usernames file untouched.
+Pass `-keep-list` if you would rather leave the usernames file untouched. The
+name still stops being checked once it is found — `-keep-list` governs the file,
+not the rotation.
 
 ## High thread counts
 
@@ -427,7 +429,7 @@ that is actually happening rather than flickering to zero whenever a single
 | `-no-proxy` | ignore the proxies file | — |
 | `-out` | directory for result files | `.` |
 | `-loop` | keep re-checking until Ctrl-C | — |
-| `-keep-list` | do not remove available names from the list | — |
+| `-keep-list` | do not remove available names from the usernames file | — |
 | `-no-confirm` | report available names without a confirming re-check | — |
 | `-no-adapt` | disable adaptive concurrency (drive threads flat out) | — |
 | `-http2` | use HTTP/2 (one connection per host, far less parallel) | — |
