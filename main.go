@@ -235,14 +235,44 @@ func (s *resultSink) close() {
 
 const appName = "Mighty"
 
+const (
+	// maxThreads is a guard against a typo, not a recommendation. Each worker
+	// is a goroutine with its own stack, so a mistyped -t is not a slow run but
+	// an out-of-memory kill. Measured throughput already declines well below
+	// this: on four cores it peaks near 500 and falls off past 1000.
+	maxThreads = 20000
+
+	// maxRetries bounds attempts per username. Beyond a handful, more attempts
+	// stop being resilience and become repetition against the same rate limit.
+	maxRetries = 10
+)
+
+// clampThreads keeps the worker count inside what a process can actually run.
+func clampThreads(n int) int {
+	if n < 1 {
+		return 1
+	}
+	if n > maxThreads {
+		warnf("-t %d would need %d goroutines; using %d. "+
+			"Throughput falls off long before this - measure with -check-proxies.",
+			n, n, maxThreads)
+		return maxThreads
+	}
+	return n
+}
+
 func main() {
 	cfg := parseFlags()
 
-	if cfg.threads < 1 {
-		cfg.threads = 1
-	}
+	cfg.threads = clampThreads(cfg.threads)
 	if cfg.retries < 1 {
 		cfg.retries = 1
+	}
+	if cfg.retries > maxRetries {
+		warnf("-retries %d is past anything useful; using %d. "+
+			"Extra attempts on one name buy nothing and spend the rate limit.",
+			cfg.retries, maxRetries)
+		cfg.retries = maxRetries
 	}
 
 	// Enable ANSI colors on Windows, then decide whether to use them.
@@ -480,7 +510,7 @@ func applyTarget(cfg *config, reports []proxyReport) {
 	}
 
 	row("Threads", cGreen(fmt.Sprintf("%d -> %d", cfg.threads, want)))
-	if n := len(rtts); want/n > 25 {
+	if n := len(rtts); n > 0 && want/n > 25 {
 		row("Warning", cYellow(fmt.Sprintf(
 			"that is %d threads per working proxy - expect throttling, add proxies",
 			want/n)))

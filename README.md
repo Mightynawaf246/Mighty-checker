@@ -512,9 +512,9 @@ that is actually happening rather than flickering to zero whenever a single
 |--------|-------------|---------|
 | `-u`, `-usernames` | usernames file | `username.txt` |
 | `-p`, `-proxies` | proxies file | `proxies.txt` |
-| `-t`, `-threads` | concurrent workers | `10` |
+| `-t`, `-threads` | concurrent workers (capped at 20 000) | `10` |
 | `-timeout` | per-request timeout | `10s` |
-| `-retries` | attempts per username | `1` |
+| `-retries` | attempts per username (capped at 10) | `1` |
 | `-delay` | fixed pause after each request | `0s` |
 | `-jitter` | random extra pause | `0s` |
 | `-no-proxy` | ignore the proxies file | — |

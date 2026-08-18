@@ -721,3 +721,32 @@ func TestFoundNameLeavesRotationAndFile(t *testing.T) {
 		t.Error("the run did not stop when the list emptied")
 	}
 }
+
+// -t and -retries are user-facing and unbounded. A mistyped -t is not a slow
+// run but an out-of-memory kill, and an unbounded attempt counter reached a
+// bit shift that overflowed and panicked the run.
+func TestThreadCountIsClamped(t *testing.T) {
+	if got := clampThreads(0); got != 1 {
+		t.Errorf("clampThreads(0) = %d, want 1", got)
+	}
+	if got := clampThreads(-5); got != 1 {
+		t.Errorf("clampThreads(-5) = %d, want 1", got)
+	}
+	if got := clampThreads(500); got != 500 {
+		t.Errorf("clampThreads(500) = %d, want it left alone", got)
+	}
+	if got := clampThreads(99999999); got != maxThreads {
+		t.Errorf("clampThreads(99999999) = %d, want %d", got, maxThreads)
+	}
+}
+
+// Every attempt number a bounded -retries can produce must yield a usable
+// pause. This is the guard that keeps the overflow unreachable.
+func TestEveryReachableAttemptIsSafe(t *testing.T) {
+	for attempt := 0; attempt <= maxRetries+2; attempt++ {
+		d := retryPause(attempt)
+		if d <= 0 || d > 800*time.Millisecond {
+			t.Errorf("attempt %d gave %v", attempt, d)
+		}
+	}
+}

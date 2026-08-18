@@ -288,8 +288,13 @@ func printProxyReport(cfg *config, reports []proxyReport) (alive int) {
 		// Throughput is concurrency divided by latency, and this is the first
 		// point in the run where both numbers are known. Saying so here saves
 		// the user discovering it by watching a rate they cannot explain.
+		//
+		// Skipped under -target: the thread count has not been worked out yet,
+		// so an estimate built on the current one would quote a rate for a
+		// setting about to be replaced, and the Target panel says it properly a
+		// moment later.
 		med := pctl(rtts, 50).Seconds()
-		if med > 0 {
+		if med > 0 && cfg.targetRPS == 0 {
 			est := float64(cfg.threads) / med
 			row("Expect", cWhite(fmt.Sprintf("~%.0f req/sec at -t %d", est, cfg.threads)))
 

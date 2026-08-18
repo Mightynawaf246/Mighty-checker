@@ -301,30 +301,6 @@ func (l *adaptiveLimiter) current() int {
 	return int(math.Ceil(l.limit))
 }
 
-// backoffFor turns a Retry-After header value into a wait duration. Instagram
-// sends either seconds or an HTTP date; both are accepted. Anything unusable
-// falls back to def, and the wait is capped so one hostile header cannot stall
-// the whole run.
-func backoffFor(retryAfter string, def, max time.Duration) time.Duration {
-	d := def
-	if retryAfter != "" {
-		if secs, err := time.ParseDuration(retryAfter + "s"); err == nil && secs > 0 {
-			d = secs
-		} else if t, err := time.Parse(time.RFC1123, retryAfter); err == nil {
-			if until := time.Until(t); until > 0 {
-				d = until
-			}
-		}
-	}
-	if d > max {
-		d = max
-	}
-	if d < 0 {
-		d = 0
-	}
-	return d
-}
-
 // rateWindow smooths a monotonically increasing counter into a per-second rate
 // measured over a trailing window.
 //
@@ -387,10 +363,29 @@ func (w *rateWindow) add(now time.Time, value float64) int {
 // again in the same instant - a lockstep that turns a steady rate into
 // alternating bursts and dead air.
 func retryPause(attempt int) time.Duration {
-	base := 80 * time.Millisecond << attempt
-	if base > 800*time.Millisecond {
-		base = 800 * time.Millisecond
+	const (
+		first = 80 * time.Millisecond
+		most  = 800 * time.Millisecond
+	)
+
+	// Double by looping rather than shifting. A Duration is an int64 of
+	// nanoseconds and -retries is user-controlled with no upper bound, so
+	// `first << attempt` goes negative at attempt 37 - and a negative bound
+	// panics the random draw, taking the whole run down. Stopping at the
+	// ceiling makes overflow unreachable regardless of what is passed in.
+	base := first
+	for i := 0; i < attempt && base < most; i++ {
+		base *= 2
 	}
-	// Spread over [0.5x, 1.5x).
-	return base/2 + time.Duration(rand.Int64N(int64(base)))
+	if base > most {
+		base = most
+	}
+
+	// Spread over [0.5x, 1.5x), then hold the ceiling: applying the jitter
+	// after the cap let the "maximum" of 800ms produce 1.2s.
+	d := base/2 + time.Duration(rand.Int64N(int64(base)))
+	if d > most {
+		d = most
+	}
+	return d
 }

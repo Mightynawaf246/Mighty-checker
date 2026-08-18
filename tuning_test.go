@@ -230,30 +230,6 @@ func TestAdaptiveLimiterNilIsSafe(t *testing.T) {
 	}
 }
 
-func TestBackoffFor(t *testing.T) {
-	max := 5 * time.Second
-	def := 300 * time.Millisecond
-
-	if got := backoffFor("", def, max); got != def {
-		t.Errorf("no header: want %v, got %v", def, got)
-	}
-	if got := backoffFor("2", def, max); got != 2*time.Second {
-		t.Errorf("seconds header: want 2s, got %v", got)
-	}
-	if got := backoffFor("garbage", def, max); got != def {
-		t.Errorf("unparseable header: want %v, got %v", def, got)
-	}
-	// A hostile header must not stall the run.
-	if got := backoffFor("99999", def, max); got != max {
-		t.Errorf("huge header: want the %v cap, got %v", max, got)
-	}
-	// A date in the past means "retry now", not "wait negative".
-	past := time.Now().Add(-time.Hour).UTC().Format(time.RFC1123)
-	if got := backoffFor(past, def, max); got != def {
-		t.Errorf("past date: want the default %v, got %v", def, got)
-	}
-}
-
 // Recovery from a bad patch must be fast up to the level that last worked, and
 // careful beyond it. Climbing one step at a time all the way back would take
 // longer than the run; charging past the known edge would just get cut again.
@@ -433,5 +409,20 @@ func TestAdaptiveLimiterSlowsNearTheKnownEdge(t *testing.T) {
 	}
 	if float64(grown) > ss+1 {
 		t.Errorf("a single step (%d) jumped past the known edge (%.0f)", grown, ss)
+	}
+}
+
+// -retries has no upper bound, and the pause used to double by shifting a
+// Duration left by the attempt number. At attempt 37 that goes negative, and a
+// negative bound panics the random draw - taking the whole run down.
+func TestRetryPauseSurvivesAnyAttemptNumber(t *testing.T) {
+	for _, attempt := range []int{0, 1, 10, 36, 37, 40, 63, 64, 1000} {
+		d := retryPause(attempt) // must not panic
+		if d <= 0 {
+			t.Errorf("attempt %d gave a non-positive pause %v", attempt, d)
+		}
+		if d > 800*time.Millisecond {
+			t.Errorf("attempt %d gave %v, past the 800ms ceiling", attempt, d)
+		}
 	}
 }
