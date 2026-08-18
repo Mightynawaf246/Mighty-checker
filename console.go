@@ -134,6 +134,11 @@ type statusView struct {
 	Cus     int
 	Threads int
 
+	// Latency is the mean round trip over the last refresh. Shown beside the
+	// concurrency because the two of them are the rate: RPS is roughly
+	// CUS / Latency, so whichever one moved is the one to act on.
+	Latency time.Duration
+
 	ProxiesOK  int // proxies not currently quarantined
 	ProxiesAll int // proxies loaded
 }
@@ -173,6 +178,10 @@ func buildStatus(name string, v statusView) string {
 		}
 		line += seg("CUS", cus) + sep
 	}
+	if v.Latency > 0 {
+		line += seg("LAT", v.Latency.Round(time.Millisecond).String()) + sep
+	}
+
 	// Proxy health, shown only when proxies are in play.
 	if v.ProxiesAll > 0 {
 		px := fmt.Sprintf("%d/%d", v.ProxiesOK, v.ProxiesAll)

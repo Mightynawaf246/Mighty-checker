@@ -56,6 +56,30 @@ type config struct {
 // they must be atomic.
 type liveStats struct {
 	attempts atomic.Int64 // every request sent, retries included
+
+	// Round-trip time, as a running total and a count rather than an average.
+	//
+	// Throughput is concurrency divided by latency. The status line showed the
+	// concurrency and never the latency, which left the most common question -
+	// "why did my rate drop" - unanswerable from the screen: a rate that halves
+	// while the concurrency holds means the proxies got slower, and a rate that
+	// halves while the latency holds means the concurrency was cut. Those have
+	// opposite remedies.
+	//
+	// Kept as sum and count so the writer can take the mean over its own window
+	// by differencing, the same way it does for the rates, with no lock on a
+	// path that runs tens of thousands of times a second.
+	latencyNanos atomic.Int64
+	latencyCount atomic.Int64
+}
+
+// observeLatency records one completed round trip.
+func (s *liveStats) observeLatency(d time.Duration) {
+	if s == nil || d <= 0 {
+		return
+	}
+	s.latencyNanos.Add(int64(d))
+	s.latencyCount.Add(1)
 }
 
 // result is the outcome of checking one username.
@@ -452,7 +476,7 @@ func main() {
 
 	elapsed := time.Since(start)
 	printSummary(cfg, counts, elapsed, ctx.Err() != nil, wl.passCount(), lim, pool,
-		stats.attempts.Load(), len(usernames))
+		stats, len(usernames))
 }
 
 // applyTarget sets the thread count from a requested rate and the latency the
@@ -747,7 +771,7 @@ func printConfig(cfg *config, usernames []string, pool *proxyPool) {
 
 // printSummary prints the final summary panel.
 func printSummary(cfg *config, counts tally, elapsed time.Duration, interrupted bool,
-	rounds int, lim *adaptiveLimiter, pool *proxyPool, attempts int64, listSize int) {
+	rounds int, lim *adaptiveLimiter, pool *proxyPool, stats *liveStats, listSize int) {
 	fmt.Println()
 	if interrupted {
 		fmt.Println(" " + cYellow("[ interrupted — partial results were flushed ]"))
@@ -775,19 +799,17 @@ func printSummary(cfg *config, counts tally, elapsed time.Duration, interrupted 
 	// tool gets asked most, and the answer is almost always one of three
 	// numbers, so print all three rather than making the user infer them.
 	if secs := elapsed.Seconds(); secs > 0 && counts.total() > 0 {
+		attempts := stats.attempts.Load()
 		ups := float64(counts.total()) / secs
 		rps := float64(attempts) / secs
 		row("Speed", cCyan(fmt.Sprintf("%.0f names/sec  (%.0f requests/sec)", ups, rps)))
 
-		// Average latency per check, derived rather than measured: with N
-		// concurrent checks running for T seconds and A attempts finished,
-		// each attempt took about N*T/A. N is the concurrency that actually
-		// ran, which the list size caps - using -t here reported a 24-name run
-		// as if 500 requests had been in flight.
-		cap := effectiveConcurrency(lim, usefulConcurrency(cfg.threads, listSize, cfg.loop))
-		if attempts > 0 && cap > 0 {
-			per := time.Duration(float64(cap) * secs / float64(attempts) * float64(time.Second))
-			row("Latency", cCyan(fmt.Sprintf("~%v per request", per.Round(time.Millisecond))))
+		// Latency, measured rather than derived. Together with the concurrency
+		// these are the rate, so a run that disappointed can be read directly:
+		// too little concurrency, or too much latency.
+		if n := stats.latencyCount.Load(); n > 0 {
+			mean := time.Duration(stats.latencyNanos.Load() / n)
+			row("Latency", cCyan(fmt.Sprintf("%v per request, measured", mean.Round(time.Millisecond))))
 		}
 	}
 
@@ -984,6 +1006,11 @@ func attemptOnce(ctx context.Context, username string, pool *proxyPool,
 	took := time.Since(started)
 	if cancel != nil {
 		cancel()
+	}
+	if err == nil {
+		// Only completed round trips: a timeout measures the deadline, not the
+		// endpoint, and averaging it in would report -timeout back as latency.
+		stats.observeLatency(took)
 	}
 
 	if err != nil {
@@ -1209,6 +1236,7 @@ func runWriter(ctx context.Context, results <-chan result, cfg *config, con *con
 	seededAt := time.Now()
 	rpsWin.add(seededAt, float64(stats.attempts.Load()))
 	upsWin.add(seededAt, 0)
+	lastLatNanos, lastLatCount := stats.latencyNanos.Load(), stats.latencyCount.Load()
 
 	refresh := func() {
 		now := time.Now()
@@ -1224,6 +1252,15 @@ func runWriter(ctx context.Context, results <-chan result, cfg *config, con *con
 		rps := rpsWin.add(now, float64(attempts))
 		ups := upsWin.add(now, float64(checked))
 
+		// Mean round trip since the last refresh, by differencing the running
+		// totals.
+		lat := time.Duration(0)
+		sumNow, cntNow := stats.latencyNanos.Load(), stats.latencyCount.Load()
+		if d := cntNow - lastLatCount; d > 0 {
+			lat = time.Duration((sumNow - lastLatNanos) / d)
+		}
+		lastLatNanos, lastLatCount = sumNow, cntNow
+
 		left := wl.size()
 		con.status(buildStatus(appName, statusView{
 			Loop:       cfg.loop,
@@ -1236,6 +1273,7 @@ func runWriter(ctx context.Context, results <-chan result, cfg *config, con *con
 			Counts:     counts,
 			Elapsed:    now.Sub(start),
 			Cus:        effectiveConcurrency(lim, usefulConcurrency(cfg.threads, left, cfg.loop)),
+			Latency:    lat,
 			Threads:    cfg.threads,
 			ProxiesOK:  pool.healthy(),
 			ProxiesAll: pool.len(),

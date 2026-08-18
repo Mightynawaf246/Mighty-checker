@@ -196,6 +196,23 @@ only way. It also warns when the thread count works out to more than ~25 per
 working proxy, since spreading a small pool that thin gets every member of it
 throttled.
 
+## Reading a rate that dropped
+
+`RPS` is roughly `CUS / LAT`, and the status line shows all three. When the rate
+falls, one of the other two moved, and which one it was decides what to do:
+
+| what you see | what happened | what helps |
+|--------------|---------------|------------|
+| `CUS` held, `LAT` rose | your proxies slowed down under the load | fewer threads per proxy, or better proxies |
+| `LAT` held, `CUS` fell | the endpoint throttled and the cap was cut | better proxies; `-no-adapt` overrides but invites blocks |
+| `PX` fell | proxies were quarantined for failing | look at the pre-flight report |
+| all three held | nothing dropped — the rate window is just noisy | nothing |
+
+The first row is the common one and the least obvious: a rate that falls from
+1 000 to 300 with the concurrency unchanged is not the tool throttling itself,
+it is a pool that answers in 20ms when idle and 120ms when hammered. More
+threads make that worse, not better.
+
 ## Keeping the rate steady
 
 A rate that swings between bursts and dead air is not a slow endpoint, it is a
@@ -382,6 +399,7 @@ sends one, with exponential backoff otherwise.
 | `Att` | total requests sent |
 | `Chk` | checked out of the round total, with percentage |
 | `CUS` | concurrency in use, shown as `used/asked` when they differ |
+| `LAT` | mean round trip right now — the other half of the rate |
 | `Left` | names still being watched (loop mode) |
 | `xN` | complete sweeps of the list finished so far (loop mode) |
 | `PX` | healthy proxies out of the total (hidden without proxies) |

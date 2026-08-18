@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -749,4 +750,89 @@ func TestEveryReachableAttemptIsSafe(t *testing.T) {
 			t.Errorf("attempt %d gave %v", attempt, d)
 		}
 	}
+}
+
+// Throughput is concurrency over latency. The status line showed the
+// concurrency and never the latency, which left "why did my rate drop"
+// unanswerable from the screen: a rate that halves while the concurrency holds
+// means the proxies got slower, and a rate that halves while the latency holds
+// means the concurrency was cut. Those have opposite remedies, so the
+// instrument has to track reality.
+func TestLatencyInstrumentTracksASlowdown(t *testing.T) {
+	var slow atomic.Bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if slow.Load() {
+			time.Sleep(60 * time.Millisecond)
+		} else {
+			time.Sleep(10 * time.Millisecond)
+		}
+		fmt.Fprint(w, bodyTaken)
+	}))
+	t.Cleanup(srv.Close)
+	withEndpoint(t, srv.URL)
+
+	var names []string
+	for i := 0; i < 100; i++ {
+		names = append(names, fmt.Sprintf("name%d", i))
+	}
+	cfg := &config{threads: 50, timeout: 10 * time.Second, retries: 1,
+		outDir: t.TempDir(), quiet: true, loop: true}
+	wl := newWorklist(names, true)
+	stats := &liveStats{}
+	sink := newResultSink(cfg)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	sample := make(chan time.Duration, 2)
+	go func() {
+		read := func() time.Duration {
+			n, c := stats.latencyNanos.Load(), stats.latencyCount.Load()
+			time.Sleep(400 * time.Millisecond)
+			n2, c2 := stats.latencyNanos.Load(), stats.latencyCount.Load()
+			if c2 == c {
+				return 0
+			}
+			return time.Duration((n2 - n) / (c2 - c))
+		}
+		sample <- read()
+		slow.Store(true)
+		time.Sleep(200 * time.Millisecond)
+		sample <- read()
+	}()
+
+	runPipeline(ctx, wl, newProxyPool(nil), newClientCacheFor(cfg.timeout, cfg.threads),
+		cfg, sink, stats, newAdaptiveLimiter(cfg.threads, true), time.Now())
+	sink.close()
+
+	fast, slowed := <-sample, <-sample
+	t.Logf("latency before %v, after %v", fast.Round(time.Millisecond), slowed.Round(time.Millisecond))
+
+	if fast <= 0 || slowed <= 0 {
+		t.Fatalf("no latency recorded: %v then %v", fast, slowed)
+	}
+	if fast > 40*time.Millisecond {
+		t.Errorf("a 10ms endpoint measured as %v", fast)
+	}
+	if slowed < 2*fast {
+		t.Errorf("a sixfold slowdown showed as %v after %v - the instrument is not tracking", slowed, fast)
+	}
+}
+
+// A timeout measures the deadline, not the endpoint. Averaging it in would
+// report -timeout back to the user as their proxies' latency.
+func TestFailedAttemptsAreNotCountedAsLatency(t *testing.T) {
+	stats := &liveStats{}
+	stats.observeLatency(50 * time.Millisecond)
+	stats.observeLatency(0)
+	stats.observeLatency(-1)
+
+	if got := stats.latencyCount.Load(); got != 1 {
+		t.Errorf("counted %d samples, want only the real one", got)
+	}
+	if got := stats.latencyNanos.Load(); got != int64(50*time.Millisecond) {
+		t.Errorf("sum = %v", time.Duration(got))
+	}
+	// A nil receiver must be safe: the pipeline passes stats optionally.
+	var nilStats *liveStats
+	nilStats.observeLatency(time.Second)
 }
