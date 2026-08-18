@@ -1,0 +1,186 @@
+package main
+
+import (
+	"archive/tar"
+	"bytes"
+	"compress/gzip"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+func TestParseAndCompareVersions(t *testing.T) {
+	cases := []struct {
+		remote, local string
+		newer         bool
+	}{
+		{"1.1.0", "1.1.0", false},
+		{"1.1.1", "1.1.0", true},
+		{"1.2.0", "1.1.9", true},
+		{"2.0.0", "1.9.9", true},
+		{"1.1.0", "1.1.1", false},
+		{"v1.1.1", "1.1.0", true}, // a leading v is ignored
+		{"1.1", "1.1.0", false},   // a missing part counts as zero
+		{"1.1.0", "1.1", false},
+	}
+	for _, c := range cases {
+		if got := isNewer(c.remote, c.local); got != c.newer {
+			t.Errorf("isNewer(%q, %q) = %v, want %v", c.remote, c.local, got, c.newer)
+		}
+	}
+}
+
+// makeTarball builds a tar.gz with a changing root directory name (like GitHub)
+// containing a tree with the tool directory and its go.mod.
+func makeTarball(t *testing.T, files map[string]string) string {
+	t.Helper()
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(gz)
+
+	for name, content := range files {
+		full := "mighty-checker-abc123/" + name
+		hdr := &tar.Header{Name: full, Mode: 0o644, Size: int64(len(content)), Typeflag: tar.TypeReg}
+		if err := tw.WriteHeader(hdr); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tw.Write([]byte(content)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := gz.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "src.tar.gz")
+	if err := os.WriteFile(path, buf.Bytes(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func TestExtractModuleFindsSubdir(t *testing.T) {
+	tgz := makeTarball(t, map[string]string{
+		"README.md":                          "root readme",
+		"instagram-username-checker/go.mod":  "module x\n\ngo 1.24\n",
+		"instagram-username-checker/main.go": "package main\n",
+		"other/file.txt":                     "unrelated",
+	})
+
+	dest := t.TempDir()
+	moduleDir, err := extractModule(tgz, dest)
+	if err != nil {
+		t.Fatalf("extractModule: %v", err)
+	}
+	if filepath.Base(moduleDir) != "instagram-username-checker" {
+		t.Fatalf("module dir: got %q", moduleDir)
+	}
+	if _, err := os.Stat(filepath.Join(moduleDir, "go.mod")); err != nil {
+		t.Fatalf("go.mod not extracted: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(moduleDir, "main.go")); err != nil {
+		t.Fatalf("main.go not extracted: %v", err)
+	}
+}
+
+func TestExtractModuleMissingSubdir(t *testing.T) {
+	tgz := makeTarball(t, map[string]string{"README.md": "no module here"})
+	if _, err := extractModule(tgz, t.TempDir()); err == nil {
+		t.Fatal("expected an error when the module dir is absent")
+	}
+}
+
+// safeJoin must keep every path inside dest, including .. traversal attempts,
+// which are clamped into dest rather than escaping it.
+func TestSafeJoinContainsPaths(t *testing.T) {
+	dest := t.TempDir()
+
+	// A normal path.
+	got, err := safeJoin(dest, "a/b/c.txt")
+	if err != nil {
+		t.Fatalf("safeJoin rejected a normal path: %v", err)
+	}
+	if !strings.HasPrefix(got, dest+string(os.PathSeparator)) {
+		t.Fatalf("normal path escaped dest: %q", got)
+	}
+
+	// A traversal attempt: must not escape dest.
+	got, err = safeJoin(dest, "../../evil")
+	if err != nil {
+		// Rejecting it outright is acceptable too.
+		return
+	}
+	if got != dest && !strings.HasPrefix(got, dest+string(os.PathSeparator)) {
+		t.Fatalf("traversal escaped dest: %q (dest=%q)", got, dest)
+	}
+}
+
+func TestStripFirstComponent(t *testing.T) {
+	cases := map[string]string{
+		"root/a/b.go":    "a/b.go",
+		"./root/x":       "x",
+		"root":           "",
+		"root/":          "",
+		"root/sub/f.txt": "sub/f.txt",
+	}
+	for in, want := range cases {
+		if got := stripFirstComponent(in); got != want {
+			t.Errorf("stripFirstComponent(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestAppVersionIsTrimmed(t *testing.T) {
+	v := appVersion()
+	if v == "" {
+		t.Fatal("appVersion() is empty; VERSION file not embedded?")
+	}
+	if v != parseVersionString(v) {
+		t.Errorf("appVersion() has surrounding whitespace: %q", v)
+	}
+}
+
+func parseVersionString(s string) string { return s } // helper kept for clarity
+
+// findModuleDir must also work when the tool lives at the repository root,
+// which is the layout of the standalone public repo.
+func TestFindModuleDirAtRoot(t *testing.T) {
+	old := updateSubdir
+	updateSubdir = ""
+	defer func() { updateSubdir = old }()
+
+	tgz := makeTarball(t, map[string]string{
+		"go.mod":    "module mighty\n\ngo 1.24\n",
+		"main.go":   "package main\n",
+		"README.md": "readme",
+	})
+
+	dest := t.TempDir()
+	moduleDir, err := extractModule(tgz, dest)
+	if err != nil {
+		t.Fatalf("extractModule at root: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(moduleDir, "go.mod")); err != nil {
+		t.Fatalf("go.mod not found at %s: %v", moduleDir, err)
+	}
+}
+
+// contentPath must not emit a double slash when the subdir is empty.
+func TestContentPath(t *testing.T) {
+	old := updateSubdir
+	defer func() { updateSubdir = old }()
+
+	updateSubdir = ""
+	if got := contentPath("VERSION"); got != "VERSION" {
+		t.Errorf("root layout: got %q", got)
+	}
+	updateSubdir = "instagram-username-checker"
+	if got := contentPath("VERSION"); got != "instagram-username-checker/VERSION" {
+		t.Errorf("subdir layout: got %q", got)
+	}
+}

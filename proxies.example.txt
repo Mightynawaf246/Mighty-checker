@@ -1,0 +1,13 @@
+# Optional. One proxy per line. All of these formats are supported:
+#   host:port
+#   host:port:user:pass
+#   http://host:port
+#   https://user:pass@host:port
+#   socks4://host:port
+#   socks5://user:pass@host:port
+#   [::1]:1080                     <- IPv6 supported
+#   socks5h://[2001:db8::1]:1080
+#
+# The scheme defaults to http when omitted.
+# Blank lines and lines starting with # are ignored; malformed lines are
+# skipped with a warning.

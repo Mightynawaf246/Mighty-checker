@@ -1,0 +1,21 @@
+# Build output
+igcheck
+mighty
+mighty.exe
+instagram-username-checker
+*.exe
+
+# Self-update leftovers
+*.old
+*.new
+
+# Result files written on every run
+available.txt
+taken.txt
+unknown.txt
+errors.txt
+
+# Your real lists. NEVER commit these - proxies.txt holds paid credentials.
+# The tool creates them from the .example templates on first run.
+username.txt
+proxies.txt
