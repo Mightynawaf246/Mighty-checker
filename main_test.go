@@ -357,3 +357,211 @@ func assertFileContains(t *testing.T, path, want string) {
 		t.Errorf("%s should contain %q, got:\n%s", filepath.Base(path), want, string(data))
 	}
 }
+
+// removeFromList must drop only the found names, keep comments and ordering,
+// and report how many usernames remain.
+func TestRemoveFromList(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "username.txt")
+	original := "# my list\ncristiano\nleomessi\n\nneymar\n# tail comment\n"
+	if err := os.WriteFile(path, []byte(original), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	left, err := removeFromList(path, []string{"leomessi"})
+	if err != nil {
+		t.Fatalf("removeFromList: %v", err)
+	}
+	if left != 2 {
+		t.Errorf("remaining: want 2, got %d", left)
+	}
+
+	got, _ := os.ReadFile(path)
+	s := string(got)
+	if strings.Contains(s, "leomessi") {
+		t.Errorf("found name was not removed:\n%s", s)
+	}
+	for _, want := range []string{"# my list", "cristiano", "neymar", "# tail comment"} {
+		if !strings.Contains(s, want) {
+			t.Errorf("lost %q from the file:\n%s", want, s)
+		}
+	}
+	// Order of survivors must be preserved.
+	if strings.Index(s, "cristiano") > strings.Index(s, "neymar") {
+		t.Errorf("order was not preserved:\n%s", s)
+	}
+}
+
+// Matching is case-insensitive, since Instagram usernames are.
+func TestRemoveFromListIsCaseInsensitive(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "u.txt")
+	os.WriteFile(path, []byte("Cristiano\nleomessi\n"), 0o644)
+
+	left, err := removeFromList(path, []string{"CRISTIANO"})
+	if err != nil {
+		t.Fatalf("removeFromList: %v", err)
+	}
+	if left != 1 {
+		t.Errorf("remaining: want 1, got %d", left)
+	}
+	got, _ := os.ReadFile(path)
+	if strings.Contains(strings.ToLower(string(got)), "cristiano") {
+		t.Errorf("case-different name not removed: %q", string(got))
+	}
+}
+
+// Removing every name must leave zero remaining, which is what stops the loop.
+func TestRemoveFromListCanEmptyTheList(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "u.txt")
+	os.WriteFile(path, []byte("# header\na\nb\n"), 0o644)
+
+	left, err := removeFromList(path, []string{"a", "b"})
+	if err != nil {
+		t.Fatalf("removeFromList: %v", err)
+	}
+	if left != 0 {
+		t.Fatalf("remaining: want 0, got %d", left)
+	}
+	// The comment survives even when no usernames are left.
+	got, _ := os.ReadFile(path)
+	if !strings.Contains(string(got), "# header") {
+		t.Errorf("comment lost: %q", string(got))
+	}
+}
+
+// No found names means the file is left completely untouched.
+func TestRemoveFromListNoopKeepsFileByteIdentical(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "u.txt")
+	original := "# keep me exactly\r\ncristiano\r\n"
+	os.WriteFile(path, []byte(original), 0o644)
+
+	if _, err := removeFromList(path, nil); err != nil {
+		t.Fatalf("removeFromList: %v", err)
+	}
+	got, _ := os.ReadFile(path)
+	if string(got) != original {
+		t.Errorf("file changed on a no-op:\nwant %q\ngot  %q", original, string(got))
+	}
+}
+
+// The pipeline must report which names were available so the caller can drop them.
+func TestTallyReportsFoundNames(t *testing.T) {
+	srv := fakeInstagram(t, nil)
+	withEndpoint(t, srv.URL)
+
+	cfg := &config{threads: 2, timeout: 5 * time.Second, retries: 1,
+		outDir: t.TempDir(), quiet: true}
+
+	counts := runOnce(context.Background(),
+		[]string{"freeuser", "takenuser"}, newProxyPool(nil), cfg)
+
+	if len(counts.found) != 1 || counts.found[0] != "freeuser" {
+		t.Fatalf("found: want [freeuser], got %v", counts.found)
+	}
+}
+
+// Full loop behavior: an available name is written to available.txt AND removed
+// from the usernames file, the next round only re-checks what is still taken,
+// and the loop ends once the list is empty. This is the watch-until-free flow.
+func TestLoopRemovesFoundNamesAndNarrows(t *testing.T) {
+	// takenuser starts taken and frees up on round 3.
+	var round atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		s := string(body)
+		switch {
+		case strings.Contains(s, `"sensitive_string_value":"freeuser"`):
+			fmt.Fprint(w, `{"data":{"x":{"status":"SUCCESS"}}}`)
+		case strings.Contains(s, `"sensitive_string_value":"takenuser"`):
+			if round.Load() >= 3 {
+				fmt.Fprint(w, `{"data":{"x":{"status":"SUCCESS"}}}`)
+			} else {
+				fmt.Fprint(w, `{"data":{"x":{"status":"VALIDATION_ERROR"}}}`)
+			}
+		default:
+			fmt.Fprint(w, `{"data":{"x":{"status":"VALIDATION_ERROR"}}}`)
+		}
+	}))
+	defer srv.Close()
+	withEndpoint(t, srv.URL)
+
+	dir := t.TempDir()
+	listPath := filepath.Join(dir, "username.txt")
+	if err := os.WriteFile(listPath,
+		[]byte("# watch list\nfreeuser\ntakenuser\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &config{threads: 50, timeout: 5 * time.Second, retries: 1,
+		outDir: dir, quiet: true, loop: true, usernamesFile: listPath}
+
+	sink := newResultSink(cfg)
+	stats := &liveStats{}
+	start := time.Now()
+
+	usernames, _ := loadLines(listPath)
+	var grand tally
+	rounds := 0
+
+	for r := 1; r <= 10; r++ {
+		round.Store(int64(r))
+		rounds = r
+		counts := runPipeline(context.Background(), usernames, newProxyPool(nil),
+			newClientCacheFor(cfg.timeout, cfg.threads), cfg, sink, stats, r, start, grand)
+		grand.add(counts)
+
+		if len(counts.found) > 0 {
+			left, err := removeFromList(listPath, counts.found)
+			if err != nil {
+				t.Fatalf("removeFromList: %v", err)
+			}
+			if left == 0 {
+				break
+			}
+		}
+		reloaded, _ := loadLines(listPath)
+		if len(reloaded) == 0 {
+			break
+		}
+		usernames = reloaded
+
+		// Round 1 frees freeuser only, so the list must narrow to one name.
+		if r == 1 && len(usernames) != 1 {
+			t.Fatalf("after round 1 the list should hold 1 name, got %v", usernames)
+		}
+	}
+	sink.close()
+
+	// takenuser frees on round 3, so the loop should end at round 3.
+	if rounds != 3 {
+		t.Errorf("loop should end on round 3, ended on %d", rounds)
+	}
+
+	// The list is empty of usernames but keeps its comment.
+	left, _ := loadLines(listPath)
+	if len(left) != 0 {
+		t.Errorf("list should be empty, still holds %v", left)
+	}
+	raw, _ := os.ReadFile(listPath)
+	if !strings.Contains(string(raw), "# watch list") {
+		t.Errorf("comment lost from the list: %q", string(raw))
+	}
+
+	// Both names ended up in available.txt, each exactly once.
+	got, err := os.ReadFile(filepath.Join(dir, "available.txt"))
+	if err != nil {
+		t.Fatalf("read available.txt: %v", err)
+	}
+	lines := strings.Fields(strings.TrimSpace(string(got)))
+	if len(lines) != 2 {
+		t.Fatalf("available.txt should hold 2 names exactly once each, got %q", string(got))
+	}
+	for _, want := range []string{"freeuser", "takenuser"} {
+		if !strings.Contains(string(got), want) {
+			t.Errorf("available.txt missing %s: %q", want, string(got))
+		}
+	}
+}

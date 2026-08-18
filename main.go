@@ -40,6 +40,7 @@ type config struct {
 	noPrompt      bool
 	forceMenu     bool
 	debug         bool
+	keepList      bool
 }
 
 // liveStats holds counters written by workers and read by the status line, so
@@ -72,6 +73,10 @@ type tally struct {
 	// Error causes, grouped so the user can see what actually needs fixing.
 	// Owned by the writer goroutine alone, so no lock is needed.
 	reasons map[string]int
+
+	// found lists the usernames that came back available this round, so the
+	// caller can drop them from the working list and stop re-checking them.
+	found []string
 }
 
 func (t *tally) addReason(r string) {
@@ -99,6 +104,7 @@ func (t *tally) add(o tally) {
 		}
 		t.reasons[r] += n
 	}
+	t.found = append(t.found, o.found...)
 }
 
 // resultSink owns the result files. Created once and kept across loop rounds,
@@ -238,7 +244,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	cache := newClientCache(cfg.timeout)
+	cache := newClientCacheFor(cfg.timeout, cfg.threads)
 	defer cache.closeIdle()
 
 	// Result files are opened once and stay open across every loop round.
@@ -249,6 +255,7 @@ func main() {
 	var grand tally
 	start := time.Now()
 	rounds := 0
+	cleared := false
 
 	for round := 1; ; round++ {
 		rounds = round
@@ -256,12 +263,38 @@ func main() {
 		grand.add(counts)
 		sink.flush()
 
+		// A name that came back available is done: it is already recorded in
+		// available.txt, so drop it from the working list and stop re-checking
+		// it. The loop then narrows to the names still taken.
+		if !cfg.keepList && len(counts.found) > 0 {
+			left, err := removeFromList(cfg.usernamesFile, counts.found)
+			if err != nil {
+				warnf("cannot update %s: %v", cfg.usernamesFile, err)
+			} else {
+				fmt.Printf("%s %s\n",
+					cGreen(fmt.Sprintf("[+] moved %d name(s) to available.txt", len(counts.found))),
+					cGray(fmt.Sprintf("- %d left in %s", left, cfg.usernamesFile)))
+				if left == 0 {
+					cleared = true
+				}
+			}
+		}
+
 		if !cfg.loop || ctx.Err() != nil {
+			break
+		}
+		if cleared {
+			fmt.Println("  " + cGreen("every name in the list is available - nothing left to watch."))
 			break
 		}
 
 		// Re-read the list each round, so the file can be edited while running.
-		if reloaded, err := loadLines(cfg.usernamesFile); err == nil && len(reloaded) > 0 {
+		reloaded, err := loadLines(cfg.usernamesFile)
+		if err == nil && len(reloaded) == 0 {
+			fmt.Println("  " + cGreen("the list is empty - nothing left to watch."))
+			break
+		}
+		if err == nil {
 			usernames = reloaded
 		}
 	}
@@ -418,8 +451,16 @@ func runPipeline(ctx context.Context, usernames []string, pool *proxyPool,
 	jobs := make(chan string)
 	results := make(chan result, cfg.threads*2)
 
+	// Never start more workers than there are names: with -t 500 on a 20-name
+	// list the extra goroutines would just idle. This matters in loop mode,
+	// where the list shrinks as names are found.
+	workers := cfg.threads
+	if n := len(usernames); n > 0 && workers > n {
+		workers = n
+	}
+
 	var wg sync.WaitGroup
-	for i := 0; i < cfg.threads; i++ {
+	for i := 0; i < workers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -666,6 +707,7 @@ func handleResult(res result, cfg *config, con *console,
 	switch res.status {
 	case statusAvailable:
 		counts.available++
+		counts.found = append(counts.found, res.username)
 		record("available", res.username)
 		con.log(cGreen("  ! Available : @" + res.username))
 		if cfg.webhook != "" {
@@ -831,6 +873,61 @@ func loadLines(path string) ([]string, error) {
 	return out, nil
 }
 
+// removeFromList deletes the given usernames from a list file and returns how
+// many usernames remain.
+//
+// Comments, blank lines, and the order of the surviving entries are preserved,
+// so the user's own file is not reformatted. The write is atomic (temp file
+// then rename) so an interrupt cannot leave a half-written list.
+func removeFromList(path string, remove []string) (remaining int, err error) {
+	if len(remove) == 0 {
+		return -1, nil
+	}
+	drop := make(map[string]bool, len(remove))
+	for _, r := range remove {
+		drop[strings.ToLower(strings.TrimSpace(r))] = true
+	}
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return 0, err
+	}
+
+	// Keep the file's original line ending style.
+	nl := "\n"
+	if strings.Contains(string(raw), "\r\n") {
+		nl = "\r\n"
+	}
+
+	var kept []string
+	for _, line := range strings.Split(strings.ReplaceAll(string(raw), "\r\n", "\n"), "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed != "" && !strings.HasPrefix(trimmed, "#") {
+			if drop[strings.ToLower(trimmed)] {
+				continue // this name was found, drop it
+			}
+			remaining++
+		}
+		kept = append(kept, line)
+	}
+
+	// Drop a trailing empty element so we do not grow a blank line each pass.
+	for len(kept) > 0 && strings.TrimSpace(kept[len(kept)-1]) == "" {
+		kept = kept[:len(kept)-1]
+	}
+
+	tmp := path + ".tmp"
+	out := strings.Join(kept, nl) + nl
+	if err := os.WriteFile(tmp, []byte(out), 0o644); err != nil {
+		return 0, err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		os.Remove(tmp)
+		return 0, err
+	}
+	return remaining, nil
+}
+
 // seedFromExample copies "<name>.example.txt" to "<name>.txt" when the latter
 // does not exist yet. Missing templates are not an error: the user may have
 // deleted them, or be pointing at a file of their own.
@@ -917,6 +1014,8 @@ func parseFlags() *config {
 	flag.BoolVar(&cfg.noPrompt, "no-prompt", false, "never show the interactive menu")
 	flag.BoolVar(&cfg.forceMenu, "menu", false, "force the interactive menu even with flags")
 	flag.BoolVar(&cfg.debug, "debug", false, "print the raw response for every check")
+	flag.BoolVar(&cfg.keepList, "keep-list", false,
+		"do not remove available names from the usernames file")
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, `Mighty - Instagram username availability checker
@@ -937,6 +1036,7 @@ options:
   -no-color             disable colors and the live status line
   -webhook URL          notify this webhook on an available username
   -loop                 keep re-checking the list forever until Ctrl-C
+  -keep-list            do not remove available names from the usernames file
   -update               check for a new version and update in place
   -version              print the version and exit
   -no-update-check      skip the startup update check

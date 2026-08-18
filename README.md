@@ -65,16 +65,49 @@ Passing any flag (for example `-t 50`) skips the menu and starts immediately,
 so scripting still works. `-no-prompt` disables the menu entirely, and `-menu`
 forces it even when flags are present.
 
-## Loop mode
+## Loop mode: watch names until they free up
 
 ```bash
-./mighty -loop -t 100
+./mighty -loop -t 200
 ```
 
 Instead of stopping when the list ends, it starts over and keeps going until
-you press Ctrl-C. `username.txt` is re-read every round, so you can edit the
-list while the tool is running. Result files stay open across rounds, so
-earlier results are never wiped and no name is written twice.
+you press Ctrl-C.
+
+The important part: **a name that comes back available is written to
+`available.txt` and removed from `username.txt`**. Each round therefore only
+re-checks the names that are still taken, and the list narrows as names free up.
+When the list empties, the loop stops on its own:
+
+```
+  ! Available : @wanted_name
+[+] moved 1 name(s) to available.txt - 12 left in username.txt
+```
+
+Comments, blank lines, and the order of the remaining names are preserved, and
+the rewrite is atomic, so an interrupt cannot corrupt the list. `username.txt`
+is re-read every round, so you can add names while the tool is running. Result
+files stay open across rounds, so earlier results are never wiped and no name is
+written twice.
+
+Pass `-keep-list` if you would rather leave the usernames file untouched.
+
+## High thread counts
+
+Connection pools are sized from `-t`, so a high thread count actually pays off
+instead of bottlenecking on socket reuse. Workers are also capped at the number
+of names, so `-t 500` on a 20-name list starts 20 workers rather than 500 idle
+ones.
+
+On Linux and macOS raise the open-file limit before a large run:
+
+```bash
+ulimit -n 65535
+```
+
+Throughput is bounded by your proxies, not by threads: it is roughly
+`proxies x safe requests per proxy`. Watch the `unknown` count — above about 20%
+you are being throttled, and the summary says so.
 
 ## Status line
 
@@ -118,6 +151,7 @@ earlier results are never wiped and no name is written twice.
 | `-no-proxy` | ignore the proxies file | — |
 | `-out` | directory for result files | `.` |
 | `-loop` | keep re-checking until Ctrl-C | — |
+| `-keep-list` | do not remove available names from the list | — |
 | `-verbose` | log every result, not just available | — |
 | `-no-color` | disable colors and the live status line | — |
 | `-webhook` | webhook URL notified on an available name | — |

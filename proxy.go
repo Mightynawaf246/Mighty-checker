@@ -209,12 +209,28 @@ type clientCache struct {
 	mu      sync.Mutex
 	clients map[string]*http.Client
 	timeout time.Duration
+
+	// idlePerHost sizes the connection pools. Left at a fixed small value, a few
+	// hundred workers spend their time reopening sockets instead of reusing
+	// them, which caps throughput well below the thread count. Scaling this with
+	// the worker count is what actually makes a high -t pay off.
+	idlePerHost int
 }
 
 func newClientCache(timeout time.Duration) *clientCache {
+	return newClientCacheFor(timeout, 0)
+}
+
+// newClientCacheFor sizes the connection pools for a given worker count.
+func newClientCacheFor(timeout time.Duration, threads int) *clientCache {
+	idle := threads
+	if idle < 64 {
+		idle = 64
+	}
 	return &clientCache{
-		clients: make(map[string]*http.Client),
-		timeout: timeout,
+		clients:     make(map[string]*http.Client),
+		timeout:     timeout,
+		idlePerHost: idle,
 	}
 }
 
@@ -227,9 +243,13 @@ func (c *clientCache) clientFor(p *proxySpec) (*http.Client, error) {
 		return cl, nil
 	}
 
+	idlePerHost := c.idlePerHost
+	if idlePerHost < 1 {
+		idlePerHost = 64
+	}
 	tr := &http.Transport{
-		MaxIdleConns:          256,
-		MaxIdleConnsPerHost:   64,
+		MaxIdleConns:          idlePerHost * 4,
+		MaxIdleConnsPerHost:   idlePerHost,
 		IdleConnTimeout:       60 * time.Second,
 		TLSHandshakeTimeout:   c.timeout,
 		ExpectContinueTimeout: time.Second,
