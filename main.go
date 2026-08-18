@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"flag"
@@ -64,6 +65,11 @@ type result struct {
 	// raw holds the response body, populated only in -debug mode so a normal
 	// run does not keep every body in memory.
 	raw string
+
+	// unconfirmed marks an available verdict that could not be corroborated on
+	// a second proxy because the pool had no other usable route. The name is
+	// still reported, but the operator is told the evidence is single-sourced.
+	unconfirmed bool
 }
 
 type tally struct {
@@ -107,7 +113,10 @@ func (t *tally) add(o tally) {
 		}
 		t.reasons[r] += n
 	}
-	t.found = append(t.found, o.found...)
+	// found is deliberately NOT accumulated here. The caller consumes it per
+	// round to prune the usernames file; carrying every hit of the whole run
+	// forward only grows a slice nobody reads, and it is copied wholesale on
+	// every status refresh.
 }
 
 // resultSink owns the result files. Created once and kept across loop rounds,
@@ -116,6 +125,12 @@ type resultSink struct {
 	files   map[string]*os.File
 	writers map[string]*bufio.Writer
 	seen    map[string]bool // prevents repeating the same line across rounds
+
+	// err latches the first write failure. Every write used to discard its
+	// error, so a full disk produced a run that reported hits on screen, fired
+	// webhooks for them, and then deleted them from the usernames file, while
+	// available.txt received nothing. The caller checks this before pruning.
+	err error
 }
 
 func newResultSink(cfg *config) *resultSink {
@@ -126,15 +141,48 @@ func newResultSink(cfg *config) *resultSink {
 	}
 	for _, name := range []string{"available", "taken", "unknown", "errors"} {
 		path := outPath(cfg, name+".txt")
-		f, err := os.Create(path)
+
+		// available.txt is appended to, never truncated. An available name has
+		// already been deleted from the usernames file by the run that found
+		// it, so this file is the ONLY record that it was ever found -
+		// truncating on open destroyed that record simply by starting the tool
+		// again. The other three are recomputable from the list and are reset
+		// per run, which also keeps them from growing without bound.
+		flags := os.O_CREATE | os.O_WRONLY | os.O_TRUNC
+		if name == "available" {
+			flags = os.O_CREATE | os.O_WRONLY | os.O_APPEND
+		}
+		f, err := os.OpenFile(path, flags, 0o644)
 		if err != nil {
-			// Failing to create a result file means silently losing results: fatal.
-			fatalf("cannot create %s: %v", path, err)
+			// Failing to open a result file means silently losing results: fatal.
+			fatalf("cannot open %s: %v", path, err)
 		}
 		s.files[name] = f
 		s.writers[name] = bufio.NewWriter(f)
+		if name == "available" {
+			s.loadSeen(name, path)
+		}
 	}
 	return s
+}
+
+// loadSeen primes the dedupe set from what the file already holds, so appending
+// to an existing file does not repeat lines a previous run wrote.
+func (s *resultSink) loadSeen(bucket, path string) {
+	f, err := os.Open(path)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line != "" {
+			s.seen[bucket+"\x00"+line] = true
+		}
+	}
 }
 
 // record writes a line to its bucket, skipping duplicates across rounds.
@@ -145,25 +193,46 @@ func (s *resultSink) record(bucket, line string) {
 	}
 	s.seen[key] = true
 	if w, ok := s.writers[bucket]; ok {
-		fmt.Fprintln(w, line)
+		if _, err := fmt.Fprintln(w, line); err != nil && s.err == nil {
+			s.err = fmt.Errorf("writing to %s.txt: %w", bucket, err)
+		}
 	}
 }
 
 // flush pushes buffers to disk without closing them (between rounds).
 func (s *resultSink) flush() {
-	for _, w := range s.writers {
-		w.Flush()
+	for name, w := range s.writers {
+		if err := w.Flush(); err != nil && s.err == nil {
+			s.err = fmt.Errorf("flushing %s.txt: %w", name, err)
+		}
+	}
+}
+
+// flushBucket pushes one bucket to disk immediately. Availability hits are rare
+// and irreplaceable, so each one is made durable as soon as it is found rather
+// than waiting for the end of a round that may last hours.
+func (s *resultSink) flushBucket(bucket string) {
+	if w, ok := s.writers[bucket]; ok {
+		if err := w.Flush(); err != nil && s.err == nil {
+			s.err = fmt.Errorf("flushing %s.txt: %w", bucket, err)
+		}
 	}
 }
 
 func (s *resultSink) close() {
 	s.flush()
-	for _, f := range s.files {
-		f.Close()
+	for name, f := range s.files {
+		if err := f.Close(); err != nil && s.err == nil {
+			s.err = fmt.Errorf("closing %s.txt: %w", name, err)
+		}
 	}
 }
 
 const appName = "Mighty"
+
+// minRoundPause is the shortest gap between two loop rounds. It exists purely
+// to stop a round that does no network work from spinning the CPU.
+const minRoundPause = 500 * time.Millisecond
 
 func main() {
 	cfg := parseFlags()
@@ -244,8 +313,18 @@ func main() {
 
 	// Graceful Ctrl-C: cancel the context so in-flight requests stop, then flush
 	// buffers and print the summary instead of dying abruptly.
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
+	// SIGHUP is included because losing an SSH session should flush and exit
+	// cleanly, not kill the process with hits still sitting in a buffer.
+	ctx, stop := signal.NotifyContext(context.Background(),
+		os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
+	// Deliberately NOT deferred: signal.NotifyContext keeps swallowing signals
+	// until stop() runs, so leaving it until the end of main means a second
+	// Ctrl-C during a slow shutdown does nothing. Restoring the default
+	// handler as soon as the first signal arrives makes the second one work.
+	go func() {
+		<-ctx.Done()
+		stop()
+	}()
 
 	cache := newClientCacheFor(cfg.timeout, cfg.threads).withHTTP2(cfg.http2)
 	defer cache.closeIdle()
@@ -274,7 +353,15 @@ func main() {
 		// A name that came back available is done: it is already recorded in
 		// available.txt, so drop it from the working list and stop re-checking
 		// it. The loop then narrows to the names still taken.
-		if !cfg.keepList && len(counts.found) > 0 {
+		//
+		// Never prune the list while the results file is failing. Deleting a
+		// name from the input on the strength of a write that did not land
+		// destroys the only two records of it at once.
+		switch {
+		case sink.err != nil:
+			warnf("results are not being written (%v) - leaving %s untouched",
+				sink.err, cfg.usernamesFile)
+		case !cfg.keepList && len(counts.found) > 0:
 			left, err := removeFromList(cfg.usernamesFile, counts.found)
 			if err != nil {
 				warnf("cannot update %s: %v", cfg.usernamesFile, err)
@@ -295,20 +382,103 @@ func main() {
 			fmt.Println("  " + cGreen("every name in the list is available - nothing left to watch."))
 			break
 		}
+		// A round in which nothing was actually checked will never become one
+		// that does. Spinning on it pins a core and rewrites the terminal
+		// forever with no network work at all.
+		if counts.total() > 0 && counts.invalid == counts.total() {
+			fmt.Println("  " + cYellow("no valid usernames in the list - nothing to watch."))
+			break
+		}
+
+		// Pace the rounds. A round can complete in microseconds — every proxy
+		// refusing the connection returns instantly — and with no pause the
+		// loop then burns 100% of a core re-reading the list tens of thousands
+		// of times a second.
+		pause := cfg.delay
+		if pause < minRoundPause {
+			pause = minRoundPause
+		}
+		select {
+		case <-time.After(pause):
+		case <-ctx.Done():
+		}
+		if ctx.Err() != nil {
+			break
+		}
 
 		// Re-read the list each round, so the file can be edited while running.
 		reloaded, err := loadLines(cfg.usernamesFile)
-		if err == nil && len(reloaded) == 0 {
+		if err != nil {
+			// Silently carrying on with a stale in-memory list hides a deleted
+			// or unreadable file for the rest of the run.
+			warnf("cannot re-read %s (%v) - continuing with the list already loaded", cfg.usernamesFile, err)
+		} else if len(reloaded) == 0 {
 			fmt.Println("  " + cGreen("the list is empty - nothing left to watch."))
 			break
-		}
-		if err == nil {
+		} else {
 			usernames = reloaded
 		}
 	}
 
 	elapsed := time.Since(start)
-	printSummary(cfg, grand, elapsed, ctx.Err() != nil, rounds)
+	printSummary(cfg, grand, elapsed, ctx.Err() != nil, rounds, lim, pool, stats.attempts.Load())
+}
+
+// printSpeedDiagnosis names the actual bottleneck of the run just finished.
+//
+// Throughput here is always concurrency divided by latency, so a disappointing
+// rate has exactly three possible causes, and the tool knows which one applied.
+// Saying so beats leaving the user to guess between buying proxies, raising
+// -t, and assuming the tool is broken.
+func printSpeedDiagnosis(cfg *config, counts tally, lim *adaptiveLimiter, pool *proxyPool) {
+	cap := effectiveConcurrency(lim, cfg.threads)
+	var lines []string
+
+	switch {
+	case cfg.noAdapt:
+		// The user asked for full throttle; nothing to say about the cap.
+	case cap < cfg.threads/2:
+		lines = append(lines, fmt.Sprintf(
+			"concurrency settled at %d of the %d threads you asked for: the endpoint "+
+				"was throttling. Better proxies raise this; -no-adapt overrides it.",
+			cap, cfg.threads))
+	}
+
+	if pool.len() > 0 {
+		if ok := pool.healthy(); ok < pool.len() {
+			lines = append(lines, fmt.Sprintf(
+				"%d of %d proxies were quarantined for failing repeatedly.",
+				pool.len()-ok, pool.len()))
+		}
+	} else if !cfg.noProxy {
+		lines = append(lines, "no proxies were loaded, so every request came from this "+
+			"one IP address - that is the ceiling, not the thread count.")
+	}
+
+	total := counts.total()
+	definite := counts.available + counts.taken
+
+	switch {
+	case total > 0 && counts.errored*100 > total*20:
+		lines = append(lines, "most requests never reached the endpoint at all, so this "+
+			"run measured your proxies, not the checker. Fix the errors above first.")
+	case definite > 0 && cap >= cfg.threads && counts.unknown*100 <= total*5:
+		// Every thread was busy and the answers were clean: nothing here is the
+		// bottleneck except how long each request takes.
+		lines = append(lines, fmt.Sprintf(
+			"all %d threads were in use and the endpoint kept up, so the limit is "+
+				"request latency: more speed needs more or faster proxies, not more threads.",
+			cfg.threads))
+	}
+
+	if len(lines) == 0 {
+		return
+	}
+	fmt.Println()
+	fmt.Println(" " + label("Speed"))
+	for _, l := range lines {
+		fmt.Println("  " + cGray("- ") + cWhite(l))
+	}
 }
 
 // runInteractiveSetup shows the menu and asks for settings when the tool is run
@@ -407,7 +577,8 @@ func printConfig(cfg *config, usernames []string, pool *proxyPool) {
 }
 
 // printSummary prints the final summary panel.
-func printSummary(cfg *config, counts tally, elapsed time.Duration, interrupted bool, rounds int) {
+func printSummary(cfg *config, counts tally, elapsed time.Duration, interrupted bool,
+	rounds int, lim *adaptiveLimiter, pool *proxyPool, attempts int64) {
 	fmt.Println()
 	if interrupted {
 		fmt.Println(" " + cYellow("[ interrupted — partial results were flushed ]"))
@@ -426,6 +597,26 @@ func printSummary(cfg *config, counts tally, elapsed time.Duration, interrupted 
 		row("Rounds", cPurple(fmt.Sprintf("%d", rounds)))
 	}
 	row("Elapsed", cCyan(elapsed.Round(time.Millisecond).String()))
+
+	// Speed, and where it came from. "Why is my rate low" is the question this
+	// tool gets asked most, and the answer is almost always one of three
+	// numbers, so print all three rather than making the user infer them.
+	if secs := elapsed.Seconds(); secs > 0 && counts.total() > 0 {
+		ups := float64(counts.total()) / secs
+		rps := float64(attempts) / secs
+		row("Speed", cCyan(fmt.Sprintf("%.0f names/sec  (%.0f requests/sec)", ups, rps)))
+
+		// Average latency per check, derived rather than measured: with N
+		// concurrent checks running for T seconds and A attempts finished,
+		// each attempt took about N*T/A.
+		cap := effectiveConcurrency(lim, cfg.threads)
+		if attempts > 0 && cap > 0 {
+			per := time.Duration(float64(cap) * secs / float64(attempts) * float64(time.Second))
+			row("Latency", cCyan(fmt.Sprintf("~%v per request", per.Round(time.Millisecond))))
+		}
+	}
+
+	printSpeedDiagnosis(cfg, counts, lim, pool)
 
 	// Error cause breakdown: this is what tells the user what to fix.
 	if len(counts.reasons) > 0 {
@@ -573,9 +764,10 @@ type attemptOutcome struct {
 }
 
 func attemptOnce(ctx context.Context, username string, pool *proxyPool,
-	cache *clientCache, cfg *config, stats *liveStats, lim *adaptiveLimiter) attemptOutcome {
+	cache *clientCache, cfg *config, stats *liveStats, lim *adaptiveLimiter,
+	avoid string) attemptOutcome {
 
-	p := pool.next()
+	p := pool.nextExcluding(avoid)
 	out := attemptOutcome{proxy: p.String(), spec: p}
 
 	client, err := cache.clientFor(p)
@@ -626,16 +818,18 @@ func attemptOnce(ctx context.Context, username string, pool *proxyPool,
 		// A definite answer means this proxy works and the rate is sustainable.
 		pool.markOK(p, took)
 		lim.onClean()
-	default:
-		// An unknown answer nearly always means this one proxy is soft blocked,
-		// not that the endpoint is asking everybody to slow down. The quarantine
-		// already handles that by rotating the proxy out, and the retry lands on
-		// a fresh one. Cutting global concurrency here too would punish the
-		// whole run for one bad proxy — with a large pool that collapses the
-		// cap to the floor and never recovers. Only an explicit 429/5xx speaks
-		// for the endpoint as a whole, so only that throttles.
-		pool.markFail(p)
+	case statusUnknown:
+		// The endpoint ANSWERED through this proxy, which proves the proxy is
+		// alive. Whether we could make sense of the answer is a fact about the
+		// endpoint, not about the proxy. Marking it failed here put every proxy
+		// in the list to sleep the moment the target started throttling, and
+		// the status line then reported 0/N healthy for a problem the proxies
+		// had nothing to do with.
+		//
+		// It still does not count as a good measurement, so no latency sample.
+		pool.markOK(p, 0)
 		if out.retryable {
+			// A 429 or 5xx does speak for the endpoint as a whole.
 			lim.onThrottle()
 		}
 	}
@@ -645,17 +839,28 @@ func attemptOnce(ctx context.Context, username string, pool *proxyPool,
 // checkWithRetries resolves one username as definitively as it can.
 //
 // Two rules drive accuracy here:
+//
 //   - An inconclusive answer (unknown, or a 429/5xx) is retried on a different
 //     proxy rather than accepted. Unknown usually means "this proxy is soft
 //     blocked", and a fresh one turns it into a real answer.
+//
 //   - An "available" verdict is confirmed with a second check through a
-//     different proxy before it is reported. A false available is the costliest
-//     mistake this tool can make, and it costs one extra request only on the
-//     rare hit, so the speed cost is negligible.
+//     genuinely different proxy before it is reported. A false available is the
+//     costliest mistake this tool can make: the name is written to
+//     available.txt AND deleted from the usernames file, so it is never
+//     re-checked and the mistake is permanent. It costs one extra request on
+//     the rare hit only, so the speed cost is negligible.
+//
+//     "Different proxy" is asked for explicitly rather than assumed. Relying on
+//     plain rotation to supply one was an emergent property that did not hold:
+//     with one proxy, with none, or once all but one were quarantined, the
+//     second opinion came from the same connection as the first — which is
+//     worthless, since a soft-blocked proxy returns the same wrong body twice.
 func checkWithRetries(ctx context.Context, username string, pool *proxyPool,
 	cache *clientCache, cfg *config, stats *liveStats, lim *adaptiveLimiter) result {
 
 	var lastErr error
+	var lastErrProxy string
 	var last attemptOutcome
 	sawResponse := false
 
@@ -671,9 +876,10 @@ func checkWithRetries(ctx context.Context, username string, pool *proxyPool,
 			break
 		}
 
-		out := attemptOnce(ctx, username, pool, cache, cfg, stats, lim)
+		out := attemptOnce(ctx, username, pool, cache, cfg, stats, lim, "")
 		if out.err != nil {
 			lastErr = out.err
+			lastErrProxy = out.proxy
 			last.proxy = out.proxy
 			continue
 		}
@@ -687,9 +893,27 @@ func checkWithRetries(ctx context.Context, username string, pool *proxyPool,
 				return outcomeResult(username, out, cfg)
 			}
 			// Confirm on a different proxy before declaring a name free.
-			confirm := attemptOnce(ctx, username, pool, cache, cfg, stats, lim)
+			avoid := ""
+			if out.spec != nil {
+				avoid = out.spec.key()
+			}
+			confirm := attemptOnce(ctx, username, pool, cache, cfg, stats, lim, avoid)
+
+			// If the pool could not supply a second proxy, the "confirmation"
+			// would just be the same connection answering twice. Say so rather
+			// than pretending the name was corroborated.
+			sameProxy := avoid != "" && confirm.spec != nil && confirm.spec.key() == avoid
+			noProxies := out.spec == nil && confirm.spec == nil
+
 			if confirm.err == nil && confirm.status == statusAvailable {
-				return outcomeResult(username, out, cfg)
+				if !sameProxy && !noProxies {
+					return outcomeResult(username, out, cfg)
+				}
+				// Only one usable route exists. Report the hit, but mark it so
+				// the operator knows it rests on a single vantage point.
+				res := outcomeResult(username, out, cfg)
+				res.unconfirmed = true
+				return res
 			}
 			if confirm.err == nil && confirm.status == statusTaken {
 				// The two disagree and the second says taken. Trust the negative.
@@ -723,7 +947,15 @@ func checkWithRetries(ctx context.Context, username string, pool *proxyPool,
 	// unknown, not an error.
 	if sawResponse {
 		last.status = statusUnknown
-		return outcomeResult(username, last, cfg)
+		res := outcomeResult(username, last, cfg)
+		if lastErr != nil {
+			// Some other attempt failed at the transport layer. Say so, and say
+			// through which proxy: without it, -debug shows one proxy's body
+			// labelled with another proxy's name, and the operator concludes a
+			// dead proxy is being blocked by the endpoint.
+			res.err = fmt.Errorf("another attempt failed via %s: %w", lastErrProxy, lastErr)
+		}
+		return res
 	}
 
 	if lastErr == nil {
@@ -791,6 +1023,12 @@ func runWriter(results <-chan result, cfg *config, con *console, sink *resultSin
 		checked := counts.total()
 		attempts := stats.attempts.Load()
 
+		// Give the limiter a chance to widen on its own. A run whose answers
+		// have all gone inconclusive supplies neither clean answers nor throttle
+		// signals, so without this the cap would sit wherever the last bad patch
+		// left it long after the endpoint recovered.
+		lim.probe(now)
+
 		rps := rpsWin.add(now, float64(attempts))
 		ups := upsWin.add(now, float64(checked))
 
@@ -826,7 +1064,7 @@ func runWriter(results <-chan result, cfg *config, con *console, sink *resultSin
 			if !ok {
 				return counts
 			}
-			handleResult(res, cfg, con, &counts, record, &whwg)
+			handleResult(res, cfg, con, &counts, record, sink.flushBucket, &whwg)
 		}
 	}
 }
@@ -835,7 +1073,8 @@ func runWriter(results <-chan result, cfg *config, con *console, sink *resultSin
 // and prints a permanent line only for notable events (available/error), or for
 // everything in verbose mode, keeping the live status line clean.
 func handleResult(res result, cfg *config, con *console,
-	counts *tally, record func(string, string), whwg *sync.WaitGroup) {
+	counts *tally, record func(string, string), flushNow func(string),
+	whwg *sync.WaitGroup) {
 
 	// In debug mode dump exactly what came back, before classifying. This is the
 	// only way to see why a name was judged the way it was.
@@ -857,7 +1096,16 @@ func handleResult(res result, cfg *config, con *console,
 		counts.available++
 		counts.found = append(counts.found, res.username)
 		record("available", res.username)
-		con.log(cGreen("  ! Available : @" + res.username))
+		// Make the hit durable now. Hits are rare and irreplaceable, and a
+		// round can run for hours; leaving them in a 4KB buffer meant a dropped
+		// SSH session or a kill -9 threw them away.
+		flushNow("available")
+		if res.unconfirmed {
+			con.log(cGreen("  ! Available : @"+res.username) +
+				cYellow("  (unconfirmed - only one usable proxy)"))
+		} else {
+			con.log(cGreen("  ! Available : @" + res.username))
+		}
 		if cfg.webhook != "" {
 			whwg.Add(1)
 			go func(name string) {
@@ -1002,6 +1250,11 @@ func loadLines(path string) ([]string, error) {
 	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 
 	var out []string
+	// Instagram usernames are case-insensitive, so "Foo" and "foo" are the same
+	// name. Checking both spends two full requests to learn one fact, and on a
+	// list stitched together from several wordlists that is a large share of the
+	// run. loadProxies already deduplicates; this brings the two in line.
+	seen := make(map[string]bool)
 	first := true
 	for sc.Scan() {
 		line := sc.Text()
@@ -1013,6 +1266,11 @@ func loadLines(path string) ([]string, error) {
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
+		key := strings.ToLower(line)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
 		out = append(out, line)
 	}
 	if err := sc.Err(); err != nil {
@@ -1040,6 +1298,11 @@ func removeFromList(path string, remove []string) (remaining int, err error) {
 	if err != nil {
 		return 0, err
 	}
+	// loadLines strips a UTF-8 BOM, so the name it hands back does not carry
+	// one. Matching here has to strip it too, or the first line of a file saved
+	// by Notepad can never be removed: it is re-checked every round forever,
+	// the tool prints "moved 1 name" every time, and -loop can never end.
+	raw = bytes.TrimPrefix(raw, []byte{0xEF, 0xBB, 0xBF})
 
 	// Keep the file's original line ending style.
 	nl := "\n"
@@ -1064,10 +1327,40 @@ func removeFromList(path string, remove []string) (remaining int, err error) {
 		kept = kept[:len(kept)-1]
 	}
 
-	tmp := path + ".tmp"
-	out := strings.Join(kept, nl) + nl
-	if err := os.WriteFile(tmp, []byte(out), 0o644); err != nil {
+	// Preserve the list's own permissions: a user who chmod 600'd a curated
+	// wordlist should not find it world-readable after the first hit.
+	mode := os.FileMode(0o644)
+	if st, err := os.Stat(path); err == nil {
+		mode = st.Mode().Perm()
+	}
+
+	// A unique temp name, so two runs sharing one list cannot overwrite each
+	// other's staging file.
+	f, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".tmp*")
+	if err != nil {
 		return 0, err
+	}
+	tmp := f.Name()
+	out := strings.Join(kept, nl) + nl
+
+	writeErr := func() error {
+		if _, err := f.WriteString(out); err != nil {
+			return err
+		}
+		// Without the sync, a crash after the rename can leave the list empty:
+		// the rename is durable but the data behind it is not.
+		if err := f.Sync(); err != nil {
+			return err
+		}
+		return f.Chmod(mode)
+	}()
+	closeErr := f.Close()
+	if writeErr == nil {
+		writeErr = closeErr
+	}
+	if writeErr != nil {
+		os.Remove(tmp)
+		return 0, writeErr
 	}
 	if err := os.Rename(tmp, path); err != nil {
 		os.Remove(tmp)

@@ -20,6 +20,57 @@ import (
 	"time"
 )
 
+// handshakeTimeout bounds a SOCKS negotiation when the context supplies no
+// deadline of its own. That is the normal case, not an edge case: net/http's
+// Transport dials with context.WithoutCancel(reqCtx), which strips the deadline
+// as well as the cancellation, so -timeout never reaches this code. Without a
+// floor here, a proxy that completes the TCP handshake and then says nothing
+// parks the dial goroutine and its socket for the life of the process.
+const handshakeTimeout = 20 * time.Second
+
+// aLongTimeAgo is a deadline already in the past. Setting it unblocks any read
+// or write in flight immediately.
+var aLongTimeAgo = time.Unix(1, 0)
+
+// guardHandshake bounds the negotiation on conn and wires ctx cancellation to
+// it. The returned function must be deferred; it stops the watchdog and clears
+// the deadline so the caller hands back a conn with no lingering bound.
+//
+// io.ReadFull cannot be interrupted by a context on its own, so cancellation
+// has to be turned into a deadline. This mirrors what golang.org/x/net's SOCKS
+// dialer does, and its absence here was a real goroutine and file-descriptor
+// leak on any proxy that accepts TCP and then goes silent.
+func guardHandshake(ctx context.Context, conn net.Conn) (func(), error) {
+	dl, ok := ctx.Deadline()
+	if !ok {
+		dl = time.Now().Add(handshakeTimeout)
+	}
+	if err := conn.SetDeadline(dl); err != nil {
+		return func() {}, err
+	}
+
+	done := make(chan struct{})
+	stopped := make(chan struct{})
+	go func() {
+		defer close(stopped)
+		select {
+		case <-ctx.Done():
+			conn.SetDeadline(aLongTimeAgo)
+		case <-done:
+		}
+	}()
+
+	return func() {
+		close(done)
+		// Wait for the watchdog to exit before clearing the deadline. Both
+		// channels can be ready at once, and select picks at random, so without
+		// this the watchdog could stamp aLongTimeAgo onto a connection that has
+		// just negotiated successfully and is about to carry real traffic.
+		<-stopped
+		conn.SetDeadline(time.Time{})
+	}, nil
+}
+
 // ------------------------------------------------------------------ SOCKS5
 
 const (
@@ -71,11 +122,11 @@ func dialSOCKS5(ctx context.Context, proxyAddr, user, pass, targetHost string, t
 		}
 	}()
 
-	if dl, has := ctx.Deadline(); has {
-		if err := conn.SetDeadline(dl); err != nil {
-			return nil, fmt.Errorf("socks5: set deadline: %w", err)
-		}
+	unguard, err := guardHandshake(ctx, conn)
+	if err != nil {
+		return nil, fmt.Errorf("socks5: set deadline: %w", err)
 	}
+	defer unguard()
 
 	// 1) Greeting: version plus the auth methods we support.
 	methods := []byte{socks5AuthNone}
@@ -256,11 +307,11 @@ func dialSOCKS4(ctx context.Context, proxyAddr, userID, targetHost string, targe
 		}
 	}()
 
-	if dl, has := ctx.Deadline(); has {
-		if err := conn.SetDeadline(dl); err != nil {
-			return nil, fmt.Errorf("socks4: set deadline: %w", err)
-		}
+	unguard, err := guardHandshake(ctx, conn)
+	if err != nil {
+		return nil, fmt.Errorf("socks4: set deadline: %w", err)
 	}
+	defer unguard()
 
 	if targetPort < 1 || targetPort > 65535 {
 		return nil, fmt.Errorf("socks4: invalid target port %d", targetPort)

@@ -16,11 +16,26 @@ import (
 // over-driving costs throughput AND correctness at the same time.
 //
 // The control law is AIMD, the same shape TCP uses for congestion:
-//   - additive increase: after a run of clean answers, raise the cap by one
+//   - additive increase: after enough clean answers, widen the cap
 //   - multiplicative decrease: on a throttle signal, cut the cap hard
 //
 // The result converges just below the point where throttling starts, which is
 // exactly the fastest rate that still yields definite answers.
+//
+// Two details are what make it actually converge rather than collapse, and both
+// were learned the hard way:
+//
+//   - A decrease happens at most once per cutCooldown, not once per throttled
+//     response. With 500 requests in flight, one burst of 429s calls onThrottle
+//     500 times; applying every one of them multiplies the cap by 0.7^500 and
+//     pins it to the floor instantly. TCP has the same problem and solves it the
+//     same way: one cut per round trip, however many packets were lost in it.
+//
+//   - Growth counts clean answers since the last actual CUT, not since the last
+//     throttle signal. Requiring consecutive clean answers makes the cap a
+//     one-way ratchet: any steady trickle of throttling resets the streak
+//     forever, so the cap can never climb back no matter how well the run is
+//     otherwise going.
 type adaptiveLimiter struct {
 	mu   sync.Mutex
 	cond *sync.Cond
@@ -29,8 +44,11 @@ type adaptiveLimiter struct {
 	min, max float64
 	inflight int
 
-	okStreak int  // consecutive clean answers since the last decrease
-	enabled  bool // false means "always allow", for -no-adapt
+	cleanSinceCut int  // clean answers since the last actual decrease
+	enabled       bool // false means "always allow", for -no-adapt
+
+	lastCut  time.Time // when the cap was last cut
+	lastGrow time.Time // when the cap was last widened
 
 	waiters int  // goroutines currently parked in acquire
 	poking  bool // is the safety-net broadcaster running?
@@ -40,6 +58,29 @@ type adaptiveLimiter struct {
 	decreases int
 }
 
+const (
+	// cutCooldown is the shortest interval between two decreases. Everything
+	// throttled inside one window counts as a single congestion event.
+	cutCooldown = time.Second
+
+	// probeInterval is how long the cap may sit unchanged before it widens on
+	// its own. Without this, a run whose answers are all inconclusive supplies
+	// neither clean answers nor throttle signals, so the cap would stay wherever
+	// the last bad patch left it even long after the endpoint recovered.
+	probeInterval = 5 * time.Second
+
+	// pokeInterval is how often parked waiters are re-checked so a cancelled
+	// context cannot leave one stuck. Releases and cap increases wake waiters
+	// directly; this is only the safety net.
+	pokeInterval = 250 * time.Millisecond
+
+	// minFloorDivisor sets how far below the requested concurrency the cap may
+	// fall. A floor of 1 is right for a single TCP connection but wrong here:
+	// the work is spread over a whole proxy pool, so one request at a time is
+	// not caution, it is a stall. Twenty times of backoff range is plenty.
+	minFloorDivisor = 20
+)
+
 // newAdaptiveLimiter starts at the requested concurrency and may grow to it or
 // shrink well below it. Starting at the full value keeps a healthy run fast from
 // the first second; the first throttle signal is what pulls it back.
@@ -47,9 +88,10 @@ func newAdaptiveLimiter(threads int, enabled bool) *adaptiveLimiter {
 	if threads < 1 {
 		threads = 1
 	}
+	floor := math.Max(1, math.Floor(float64(threads)/minFloorDivisor))
 	l := &adaptiveLimiter{
 		limit:   float64(threads),
-		min:     1,
+		min:     floor,
 		max:     float64(threads),
 		enabled: enabled,
 	}
@@ -89,7 +131,11 @@ func (l *adaptiveLimiter) acquire(ctx context.Context) bool {
 // poke broadcasts on a timer for as long as anyone is waiting, then exits.
 func (l *adaptiveLimiter) poke() {
 	for {
-		time.Sleep(50 * time.Millisecond)
+		// Only fast enough to notice a cancelled context, not fast enough to
+		// matter. This wakes every parked waiter, so at a high thread count a
+		// tighter interval is thousands of pointless wakeups a second; a
+		// quarter second of extra shutdown latency is not worth that.
+		time.Sleep(pokeInterval)
 		l.mu.Lock()
 		if l.waiters == 0 {
 			l.poking = false
@@ -132,23 +178,48 @@ func (l *adaptiveLimiter) onClean() {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	l.okStreak++
-	if l.okStreak < cleanStreakForGrowth || l.limit >= l.max {
+	l.cleanSinceCut++
+	if l.cleanSinceCut < cleanStreakForGrowth {
 		return
 	}
-	l.okStreak = 0
+	l.cleanSinceCut = 0
+	l.growLocked()
+}
 
+// growLocked widens the cap by one step. The caller holds the lock.
+func (l *adaptiveLimiter) growLocked() {
+	if l.limit >= l.max {
+		return
+	}
 	// Well below the ceiling, recovery is what matters, so grow geometrically:
-	// climbing from 1 back to 500 one step at a time would take the rest of the
-	// run. Near the ceiling, creep by one instead, so the cap settles on the
-	// sustainable rate rather than overshooting and being cut again.
+	// climbing from the floor back to 500 one step at a time would take the rest
+	// of the run. Near the ceiling, creep by one instead, so the cap settles on
+	// the sustainable rate rather than overshooting and being cut again.
 	step := 1.0
 	if l.limit < l.max/2 {
 		step = l.limit * 0.5
 	}
 	l.limit = math.Min(l.max, l.limit+step)
+	l.lastGrow = time.Now()
 	l.increases++
 	l.cond.Broadcast()
+}
+
+// probe widens the cap when nothing has moved it for a while, so a run that has
+// stopped producing definite answers still climbs back out of a hole.
+func (l *adaptiveLimiter) probe(now time.Time) {
+	if l == nil || !l.enabled {
+		return
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.limit >= l.max {
+		return
+	}
+	if now.Sub(l.lastCut) < probeInterval || now.Sub(l.lastGrow) < probeInterval {
+		return
+	}
+	l.growLocked()
 }
 
 // onThrottle records a throttle signal (429/5xx, or an unknown response, which
@@ -160,7 +231,16 @@ func (l *adaptiveLimiter) onThrottle() {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	l.okStreak = 0
+	// Everything throttled inside one cooldown window is one congestion event.
+	// Without this the cap is multiplied by 0.7 once per in-flight request and
+	// hits the floor on the first burst.
+	now := time.Now()
+	if !l.lastCut.IsZero() && now.Sub(l.lastCut) < cutCooldown {
+		return
+	}
+	l.lastCut = now
+	l.cleanSinceCut = 0
+
 	next := l.limit * 0.7
 	if next < l.min {
 		next = l.min
@@ -171,14 +251,16 @@ func (l *adaptiveLimiter) onThrottle() {
 	}
 }
 
-// current reports the cap, for display.
+// current reports the cap, for display. acquire admits while inflight < limit,
+// so a limit of 2.4 admits 3; reporting int(2.4) would understate the real
+// concurrency by one.
 func (l *adaptiveLimiter) current() int {
 	if l == nil || !l.enabled {
 		return 0
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	return int(l.limit)
+	return int(math.Ceil(l.limit))
 }
 
 // backoffFor turns a Retry-After header value into a wait duration. Instagram

@@ -26,6 +26,18 @@ var (
 	updateSubdir = "" // the tool lives at the repository root
 )
 
+const (
+	// downloadTimeout covers the network work only.
+	downloadTimeout = 60 * time.Second
+
+	// buildTimeout covers the compile, which on a cold machine may also fetch
+	// the module cache and even the toolchain itself.
+	buildTimeout = 10 * time.Minute
+
+	// maxEntryBytes caps a single file extracted from the archive.
+	maxEntryBytes = 64 << 20
+)
+
 func envOr(key, def string) string {
 	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
 		return v
@@ -203,12 +215,21 @@ func extractModule(tgzPath, dest string) (string, error) {
 			if err != nil {
 				return "", err
 			}
-			// Safety cap against an oversized archive.
-			if _, err := io.CopyN(w, tr, 64<<20); err != nil && err != io.EOF {
+			// Safety cap against an oversized archive. An entry that reaches the
+			// cap exactly is an error, not a success: truncating it silently
+			// produces a source tree that looks extracted but does not compile.
+			n, err := io.CopyN(w, tr, maxEntryBytes)
+			if err != nil && err != io.EOF {
 				w.Close()
 				return "", err
 			}
-			w.Close()
+			if n >= maxEntryBytes {
+				w.Close()
+				return "", fmt.Errorf("archive entry %s exceeds the %d byte limit", hdr.Name, int64(maxEntryBytes))
+			}
+			if err := w.Close(); err != nil {
+				return "", fmt.Errorf("writing %s: %w", hdr.Name, err)
+			}
 		}
 	}
 
@@ -290,13 +311,43 @@ func buildBinary(ctx context.Context, moduleDir, outPath string) error {
 	if err != nil {
 		return fmt.Errorf("the Go toolchain is required to self-update from source; install Go or rebuild manually")
 	}
-	cmd := exec.CommandContext(ctx, goBin, "build", "-o", outPath, ".")
+	// A compile is not a network call, and it gets its own budget. Sharing the
+	// download's short deadline meant a cold module cache, or a toolchain the
+	// build decides to fetch, was killed part way and reported to the user as
+	// "go build failed: signal: killed".
+	buildCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), buildTimeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(buildCtx, goBin, "build", "-o", outPath, ".")
 	cmd.Dir = moduleDir
-	cmd.Env = append(os.Environ(), "CGO_ENABLED=0")
+	// GOOS/GOARCH are pinned to what is running. Inherited from the environment,
+	// a shell that exports GOOS=linux for cross-compiling would build an
+	// unrunnable binary and install it over the working one.
+	cmd.Env = append(os.Environ(),
+		"CGO_ENABLED=0",
+		"GOOS="+runtime.GOOS,
+		"GOARCH="+runtime.GOARCH,
+	)
 	if out, err := cmd.CombinedOutput(); err != nil {
+		if buildCtx.Err() != nil {
+			return fmt.Errorf("go build timed out after %s (a first build may download the toolchain; try again)", buildTimeout)
+		}
 		return fmt.Errorf("go build failed: %v\n%s", err, strings.TrimSpace(string(out)))
 	}
 	return nil
+}
+
+// verifyBinary runs the freshly built binary to prove it executes on this
+// machine before it replaces the one that currently works.
+func verifyBinary(path string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	out, err := exec.CommandContext(ctx, path, "-version").CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("the newly built binary does not run: %v", err)
+	}
+	return strings.TrimSpace(string(out)), nil
 }
 
 // replaceExecutable swaps the running executable for the new one, safely on every OS.
@@ -312,22 +363,43 @@ func replaceExecutable(newBin string) error {
 	if runtime.GOOS == "windows" {
 		// A running executable cannot be deleted on Windows, but it can be renamed;
 		// move it aside, write the new one in its place, and delete the old one later.
+		//
+		// The new binary is staged beside the target FIRST, so the window in
+		// which the only copy of the tool is a file called ".old" lasts as long
+		// as a rename rather than as long as a file copy.
 		old := self + ".old"
+		staged := self + ".new"
 		_ = os.Remove(old)
-		if err := os.Rename(self, old); err != nil {
+		_ = os.Remove(staged)
+
+		if err := copyFile(newBin, staged, 0o755); err != nil {
+			_ = os.Remove(staged)
 			return err
 		}
-		if err := copyFile(newBin, self, 0o755); err != nil {
-			// Try to roll back.
+		if err := os.Rename(self, old); err != nil {
+			_ = os.Remove(staged)
+			return err
+		}
+		if err := os.Rename(staged, self); err != nil {
+			// Roll back: put the working binary back where it was.
 			_ = os.Rename(old, self)
+			_ = os.Remove(staged)
 			return err
 		}
 		return nil
 	}
 
 	// Unix: write to a sibling file, then rename atomically over the original.
+	// The original's mode is preserved rather than forced to 0755, so a binary
+	// deliberately installed as 0700 does not become world-executable.
+	mode := os.FileMode(0o755)
+	if st, err := os.Stat(self); err == nil {
+		mode = st.Mode().Perm()
+	}
 	tmp := self + ".new"
-	if err := copyFile(newBin, tmp, 0o755); err != nil {
+	if err := copyFile(newBin, tmp, mode); err != nil {
+		// Never leave a half-written executable sitting next to the real one.
+		_ = os.Remove(tmp)
 		return err
 	}
 	if err := os.Rename(tmp, self); err != nil {
@@ -374,7 +446,7 @@ func runUpdateCommand() int {
 	fmt.Println(" " + label(appName+" Update"))
 	fmt.Printf("  %s %s\n", cGray("current  :"), cCyan("v"+appVersion()))
 
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), downloadTimeout)
 	defer cancel()
 
 	fmt.Println("  " + cGray("checking for updates..."))
@@ -420,6 +492,15 @@ func runUpdateCommand() int {
 		return 1
 	}
 
+	// Prove the thing we built actually runs before it replaces the thing that
+	// currently works. Nothing else in this path verifies what gets installed.
+	built, err := verifyBinary(newBin)
+	if err != nil {
+		fmt.Println("  " + cRed(err.Error()))
+		fmt.Println("  " + cGray("your current version has not been touched"))
+		return 1
+	}
+
 	fmt.Println("  " + cGray("installing..."))
 	self, _ := os.Executable()
 	if err := replaceExecutable(newBin); err != nil {
@@ -428,7 +509,10 @@ func runUpdateCommand() int {
 		return 1
 	}
 
-	fmt.Println("  " + cGreen(fmt.Sprintf("updated: v%s -> v%s", appVersion(), remote)))
+	// Report what the new binary says about itself, not what the version file
+	// claimed before the build. They are the same in a normal update; if they
+	// ever differ, the user needs to see the real one.
+	fmt.Println("  " + cGreen(fmt.Sprintf("updated: v%s -> %s", appVersion(), built)))
 	if self != "" {
 		fmt.Println("  " + cGray("installed at: "+self))
 	}

@@ -84,20 +84,96 @@ func TestAdaptiveLimiterAIMD(t *testing.T) {
 	}
 }
 
-// Sustained throttling must bottom out at 1, never at 0, which would deadlock
-// the run.
-func TestAdaptiveLimiterNeverReachesZero(t *testing.T) {
-	lim := newAdaptiveLimiter(32, true)
-	for i := 0; i < 100; i++ {
-		lim.onThrottle()
+// throttleNow applies cuts regardless of the cooldown, so a test can drive the
+// cap to a specific place without sleeping through real time.
+func throttleNow(l *adaptiveLimiter, times int) {
+	for i := 0; i < times; i++ {
+		l.mu.Lock()
+		l.lastCut = time.Time{}
+		l.mu.Unlock()
+		l.onThrottle()
 	}
-	if got := lim.current(); got != 1 {
-		t.Errorf("floor: want 1, got %d", got)
+}
+
+// One burst of throttled responses is ONE congestion event, not one per
+// response. With hundreds of requests in flight, applying every 429 multiplies
+// the cap by 0.7 hundreds of times and pins it to the floor instantly - which
+// is exactly what capped a 500-thread run at about 24 requests per second.
+func TestAdaptiveLimiterBurstCountsOnce(t *testing.T) {
+	for _, burst := range []int{10, 200, 500} {
+		lim := newAdaptiveLimiter(500, true)
+		for i := 0; i < burst; i++ {
+			lim.onThrottle()
+		}
+		if got := lim.current(); got != 350 {
+			t.Errorf("%d simultaneous throttles: want one cut to 350, got %d", burst, got)
+		}
 	}
-	if !lim.acquire(context.Background()) {
-		t.Error("a limiter at the floor must still hand out its one slot")
+}
+
+// A steady trickle of throttling must not stop the cap from growing. Requiring
+// consecutive clean answers made the cap a one-way ratchet: any throttle reset
+// the streak, so it could never climb back however well the run was going.
+func TestAdaptiveLimiterGrowsDespiteOccasionalThrottling(t *testing.T) {
+	lim := newAdaptiveLimiter(500, true)
+	throttleNow(lim, 40) // drive it down first
+	start := lim.current()
+
+	for i := 0; i < 3000; i++ {
+		lim.onClean()
+		lim.onClean()
+		lim.onClean()
+		lim.onThrottle() // inside the cooldown, so it is absorbed
 	}
-	lim.release()
+	if got := lim.current(); got <= start {
+		t.Errorf("cap did not recover under a 3:1 clean/throttle mix: %d -> %d", start, got)
+	}
+}
+
+// Sustained throttling must bottom out at a usable floor, never at 0 (which
+// would deadlock) and never at 1 (which is a stall, not caution - the work is
+// spread across a whole proxy pool).
+func TestAdaptiveLimiterFloorIsUsable(t *testing.T) {
+	lim := newAdaptiveLimiter(500, true)
+	throttleNow(lim, 200)
+	if got, want := lim.current(), 500/minFloorDivisor; got != want {
+		t.Errorf("floor: want %d, got %d", want, got)
+	}
+
+	// A small thread count still floors at 1 rather than 0.
+	small := newAdaptiveLimiter(4, true)
+	throttleNow(small, 100)
+	if got := small.current(); got != 1 {
+		t.Errorf("small floor: want 1, got %d", got)
+	}
+	if !small.acquire(context.Background()) {
+		t.Error("a limiter at the floor must still hand out its slot")
+	}
+	small.release()
+}
+
+// A cap that has stopped receiving any signal at all must still climb back on
+// its own, or a run whose answers all went inconclusive stays slow forever.
+func TestAdaptiveLimiterProbesUpwardWhenIdle(t *testing.T) {
+	lim := newAdaptiveLimiter(500, true)
+	throttleNow(lim, 50)
+	low := lim.current()
+
+	// Nothing has moved it for longer than probeInterval.
+	future := time.Now().Add(2 * probeInterval)
+	lim.probe(future)
+	if got := lim.current(); got <= low {
+		t.Errorf("idle probe did not widen the cap: %d -> %d", low, got)
+	}
+
+	// But it must not widen while the cut is still recent.
+	lim2 := newAdaptiveLimiter(500, true)
+	throttleNow(lim2, 50)
+	before := lim2.current()
+	lim2.probe(time.Now())
+	if got := lim2.current(); got != before {
+		t.Errorf("probed too soon after a cut: %d -> %d", before, got)
+	}
 }
 
 // With -no-adapt the limiter is transparent: it never blocks and reports no cap.
@@ -183,11 +259,9 @@ func TestBackoffFor(t *testing.T) {
 // throttled run stay slow forever.
 func TestAdaptiveLimiterRecoversQuicklyFromTheFloor(t *testing.T) {
 	lim := newAdaptiveLimiter(500, true)
-	for i := 0; i < 100; i++ {
-		lim.onThrottle()
-	}
-	if got := lim.current(); got != 1 {
-		t.Fatalf("setup: want the floor, got %d", got)
+	throttleNow(lim, 100)
+	if got, want := lim.current(), 500/minFloorDivisor; got != want {
+		t.Fatalf("setup: want the floor %d, got %d", want, got)
 	}
 
 	// Feed clean answers and count how many it takes to get back to half the

@@ -25,14 +25,16 @@ func fakeInstagram(t *testing.T, hits *atomic.Int64) *httptest.Server {
 			hits.Add(1)
 		}
 		body, _ := io.ReadAll(r.Body)
-		s := string(body)
+		name := usernameFromPayload(string(body))
 
 		// Mirrors the endpoint's real contract: SUCCESS for a free name,
-		// VALIDATION_ERROR for a taken one.
+		// VALIDATION_ERROR for a taken one. Matched by prefix, so freeuser0..N
+		// behave like freeuser - the earlier exact match meant every numbered
+		// name in the pipeline tests silently took the fallback branch.
 		switch {
-		case strings.Contains(s, `"sensitive_string_value":"takenuser"`):
+		case strings.HasPrefix(name, "takenuser"):
 			fmt.Fprint(w, `{"data":{"xfb_caa_registration_field_validation":{"status":"VALIDATION_ERROR"}}}`)
-		case strings.Contains(s, `"sensitive_string_value":"freeuser"`):
+		case strings.HasPrefix(name, "freeuser"):
 			fmt.Fprint(w, `{"data":{"xfb_caa_registration_field_validation":{"status":"SUCCESS"}}}`)
 		default:
 			fmt.Fprint(w, `<html>429 rate limited</html>`)
@@ -40,6 +42,22 @@ func fakeInstagram(t *testing.T, hits *atomic.Int64) *httptest.Server {
 	}))
 	t.Cleanup(srv.Close)
 	return srv
+}
+
+// usernameFromPayload pulls the checked username out of the form-encoded body,
+// the same way the real endpoint would read it.
+func usernameFromPayload(body string) string {
+	const key = `"username":{"sensitive_string_value":"`
+	i := strings.Index(body, key)
+	if i < 0 {
+		return ""
+	}
+	rest := body[i+len(key):]
+	j := strings.Index(rest, `"`)
+	if j < 0 {
+		return ""
+	}
+	return rest[:j]
 }
 
 // runOnce runs a single round with a fresh sink and stats. It wraps runPipeline
@@ -139,21 +157,22 @@ func TestPipelineProcessesEveryUsernameExactlyOnce(t *testing.T) {
 
 	counts := runOnce(context.Background(), usernames, newProxyPool(nil), cfg)
 
-	total := counts.available + counts.taken + counts.unknown + counts.invalid + counts.errored
-	if total != len(usernames) {
-		t.Fatalf("want %d results, got %d", len(usernames), total)
+	if counts.total() != len(usernames) {
+		t.Fatalf("want %d results, got %d (%+v)", len(usernames), counts.total(), counts)
 	}
-	// Every name here comes back available, and an available verdict is
-	// confirmed on a second proxy before it is reported, so each name costs
+	if counts.available != len(usernames) {
+		t.Fatalf("every name here is free; want %d available, got %+v", len(usernames), counts)
+	}
+	// An available verdict is confirmed with a second check, so each name costs
 	// exactly two requests: one to find it, one to confirm it.
 	if got, want := hits.Load(), int64(2*len(usernames)); got != want {
 		t.Errorf("want %d requests, got %d", want, got)
 	}
 
-	// No duplicates and nothing missing in the output file.
-	data, err := os.ReadFile(filepath.Join(dir, "unknown.txt"))
+	// Every name must be in the file, exactly once.
+	data, err := os.ReadFile(filepath.Join(dir, "available.txt"))
 	if err != nil {
-		t.Fatalf("read unknown.txt: %v", err)
+		t.Fatalf("read available.txt: %v", err)
 	}
 	seen := map[string]int{}
 	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
@@ -161,9 +180,12 @@ func TestPipelineProcessesEveryUsernameExactlyOnce(t *testing.T) {
 			seen[line]++
 		}
 	}
-	for name, n := range seen {
-		if n != 1 {
-			t.Errorf("username %q written %d times", name, n)
+	if len(seen) != len(usernames) {
+		t.Errorf("available.txt holds %d distinct names, want %d", len(seen), len(usernames))
+	}
+	for _, u := range usernames {
+		if seen[u] != 1 {
+			t.Errorf("username %q written %d times, want 1", u, seen[u])
 		}
 	}
 }

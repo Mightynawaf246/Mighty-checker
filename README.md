@@ -161,6 +161,23 @@ the point where throttling starts — the fastest rate that still yields definit
 answers. Recovery is geometric while the cap is well below the ceiling, so a run
 that got cut climbs back in seconds rather than never.
 
+Three details are what make it converge instead of collapse:
+
+- **One cut per congestion event, not per response.** With 500 requests in
+  flight, a burst of 429s reports a throttle 500 times; applying all of them
+  multiplies the cap by `0.7^500` and pins it to the floor instantly. TCP has
+  the same problem and solves it the same way — one cut per round trip, however
+  many packets were lost in it.
+- **Growth counts clean answers since the last cut, not consecutive ones.**
+  Requiring an unbroken streak makes the cap a one-way ratchet: any steady
+  trickle of throttling resets it forever and the cap can never climb back.
+- **The floor is `-t`/20, not 1.** One request at a time is right for a single
+  TCP connection and wrong here, where the work is spread over a whole proxy
+  pool. A cap of 1 is not caution, it is a stall.
+
+If nothing has moved the cap for a few seconds it widens on its own, so a run
+whose answers all went inconclusive still climbs back out.
+
 Only an explicit `429`/`5xx` counts as a throttle: an `unknown` answer means
 *that one proxy* is soft blocked, and the quarantine below already handles it.
 Letting every unknown cut the global cap made a handful of bad proxies collapse
@@ -209,6 +226,24 @@ sends one, with exponential backoff otherwise.
 | `CUS` | concurrency in use — the adaptive cap, or the worker count if lower |
 | `PX` | healthy proxies out of the total (hidden without proxies) |
 | `A / T / U / E` | available / taken / unknown / errors |
+
+## Reading the summary
+
+Every run ends with the numbers that explain its speed:
+
+```
+  Speed    : 9918 names/sec  (9918 requests/sec)
+  Latency  : ~50ms per request
+
+ [ Speed ]
+  - all 500 threads were in use and the endpoint kept up, so the limit is
+    request latency: more speed needs more or faster proxies, not more threads.
+```
+
+Throughput is always `concurrency / latency`, so a disappointing rate has only
+three possible causes and the tool names the one that applied: the endpoint
+throttled and the cap settled below your `-t`; proxies were quarantined; or
+every thread was busy and latency is the wall.
 
 ## Raising UPS
 
@@ -357,6 +392,25 @@ The scheme defaults to `http` when omitted, and scheme case does not matter.
 When no proxies are used, the tool honors the `HTTP_PROXY`, `HTTPS_PROXY`, and
 `NO_PROXY` environment variables like other Go tools.
 
+## Result files
+
+`available.txt` is **appended to, never overwritten**. It has to be: a name found
+available is deleted from `username.txt` by the run that found it, so this file
+is the only remaining record that it was ever found. Re-running the tool used to
+truncate it, which destroyed every previous hit. Lines already in the file are
+not repeated.
+
+The other three (`taken`, `unknown`, `errors`) are reset each run. They are
+recomputable from the list, and appending them forever would grow them without
+bound.
+
+Hits are flushed to disk the moment they are found, so `tail -f available.txt`
+works and a dropped SSH session or a `kill -9` cannot take them with it.
+
+If writing to the result files starts failing — a full disk, a read-only mount —
+the run says so and **stops pruning `username.txt`**, rather than deleting names
+on the strength of a write that never landed.
+
 ## Output
 
 | File | Contents |
@@ -381,7 +435,14 @@ The endpoint's response carries a status field, and that is the signal used:
 On top of that contract the classifier is deliberately conservative, so
 `available.txt` does not fill with false positives:
 
-- **available** only on HTTP 200 with an explicit positive status.
+- **available** only on HTTP 200 whose body carries the contract's own field,
+  `"status":"success"`. Matching the bare token `"success"` anywhere in the body
+  is not the same thing: `{"success":false,"error":"Insufficient balance"}` —
+  what a proxy provider returns when the account runs out of credit — contains
+  that token while asserting the exact opposite.
+- A populated `"errors"` array means the request failed, so nothing in that body
+  is a verdict. `"errors":null` and `"errors":[]` are normal and do not
+  disqualify a reply.
 - **taken** on `VALIDATION_ERROR`, or an explicit marker such as
   `username_is_taken`.
 - **429/5xx** (throttling) becomes unknown and is retried on a different proxy.

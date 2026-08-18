@@ -34,7 +34,8 @@ func TestParseProxyFormats(t *testing.T) {
 		// userinfo
 		{"https://bob:secret@1.2.3.4:8443", "https", "1.2.3.4", 8443, "bob", "secret", proxyHTTP},
 		// socks
-		{"socks4://1.2.3.4:1080", "socks4a", "1.2.3.4", 1080, "", "", proxySOCKS4},
+		{"socks4://1.2.3.4:1080", "socks4", "1.2.3.4", 1080, "", "", proxySOCKS4},
+		{"socks4a://1.2.3.4:1080", "socks4a", "1.2.3.4", 1080, "", "", proxySOCKS4},
 		{"socks4a://1.2.3.4:1080", "socks4a", "1.2.3.4", 1080, "", "", proxySOCKS4},
 		{"socks5://1.2.3.4:1080", "socks5h", "1.2.3.4", 1080, "", "", proxySOCKS5},
 		{"socks5h://bob:secret@1.2.3.4:1080", "socks5h", "1.2.3.4", 1080, "bob", "secret", proxySOCKS5},
@@ -377,7 +378,9 @@ func TestProxyPoolQuarantineExpires(t *testing.T) {
 		t.Fatalf("want the proxy quarantined, healthy = %d", got)
 	}
 
-	time.Sleep(30 * time.Millisecond)
+	// The sweep that retires expired quarantines runs at most every
+	// refreshEvery, so give it a window rather than expecting it instantly.
+	time.Sleep(refreshEvery + 50*time.Millisecond)
 	if got := pool.healthy(); got != 1 {
 		t.Errorf("the quarantine should have expired, healthy = %d", got)
 	}

@@ -17,8 +17,11 @@ const (
 	friendlyName = "useCAARegistrationFieldValidationQuery"
 	docID        = "25391252800555418"
 
-	// Cap on the response body we read, guarding against an unexpectedly huge reply.
-	maxBodyBytes = 1 << 20
+	// Cap on the response body we read. A real reply from this endpoint is well
+	// under a kilobyte, so anything approaching this is a block page or a
+	// gateway error. Keeping the cap tight bounds both the read and the
+	// lowercased copy the classifier makes of every single response.
+	maxBodyBytes = 64 << 10
 )
 
 // Check outcomes.
@@ -117,6 +120,79 @@ var takenMarkers = []string{
 	"username isn't available",
 }
 
+// hasJSONString reports whether the (already lowercased) body contains the
+// field key with exactly the string value given, tolerating whitespace around
+// the colon: "status":"success" and "status" : "success" both match.
+//
+// This exists because matching a bare token is not the same as matching the
+// contract. The body `{"success":false,"error":"Insufficient balance"}` — what a
+// proxy provider returns when the account runs out of credit — contains the
+// token `"success"` while asserting the exact opposite of availability.
+func hasJSONString(low, key, value string) bool {
+	needle := `"` + key + `"`
+	want := `"` + value + `"`
+	for i := 0; ; {
+		j := strings.Index(low[i:], needle)
+		if j < 0 {
+			return false
+		}
+		p := i + j + len(needle)
+		i = p
+
+		for p < len(low) && isJSONSpace(low[p]) {
+			p++
+		}
+		if p >= len(low) || low[p] != ':' {
+			continue
+		}
+		p++
+		for p < len(low) && isJSONSpace(low[p]) {
+			p++
+		}
+		if strings.HasPrefix(low[p:], want) {
+			return true
+		}
+	}
+}
+
+func isJSONSpace(c byte) bool {
+	return c == ' ' || c == '\t' || c == '\n' || c == '\r'
+}
+
+// hasErrorEnvelope reports whether the body carries a populated GraphQL errors
+// array. `"errors":null` and `"errors":[]` are normal in a successful reply and
+// must not disqualify it.
+func hasErrorEnvelope(low string) bool {
+	for i := 0; ; {
+		j := strings.Index(low[i:], `"errors"`)
+		if j < 0 {
+			return false
+		}
+		p := i + j + len(`"errors"`)
+		i = p
+		for p < len(low) && isJSONSpace(low[p]) {
+			p++
+		}
+		if p >= len(low) || low[p] != ':' {
+			continue
+		}
+		p++
+		for p < len(low) && isJSONSpace(low[p]) {
+			p++
+		}
+		// A populated array is the only form that means "this reply failed".
+		if p < len(low) && low[p] == '[' {
+			q := p + 1
+			for q < len(low) && isJSONSpace(low[q]) {
+				q++
+			}
+			if q < len(low) && low[q] != ']' {
+				return true
+			}
+		}
+	}
+}
+
 // interpret classifies a check from the HTTP status code and response body.
 //
 // The endpoint's actual contract, as used by current checkers:
@@ -124,9 +200,12 @@ var takenMarkers = []string{
 //	status SUCCESS          -> the username is AVAILABLE
 //	status VALIDATION_ERROR -> the username is TAKEN
 //
-// Governing rule: never assume "available". Availability is declared only on an
-// explicit positive signal; anything ambiguous or non-200 is reported as unknown
-// rather than guessed. That keeps available.txt free of false positives.
+// Governing rule: never assume "available". Availability is declared only on the
+// contract's explicit positive signal; anything ambiguous or non-200 is reported
+// as unknown rather than guessed. That keeps available.txt free of false
+// positives, which is the costliest mistake this tool can make — a false hit is
+// also written to available.txt AND deleted from the usernames file, so it is
+// never re-checked and the mistake is permanent.
 //
 // It also returns retryable: true when the response indicates temporary
 // throttling (429/5xx), so the caller retries on a different proxy.
@@ -144,8 +223,7 @@ func interpret(httpCode int, body string) (status string, retryable bool) {
 	low := strings.ToLower(body)
 
 	// TAKEN is evaluated before AVAILABLE throughout. If a response ever carries
-	// both signals, the safe reading is "taken" — a false "available" is the
-	// costliest mistake this tool can make.
+	// both signals, the safe reading is "taken".
 	if strings.Contains(low, "validation_error") {
 		return statusTaken, false
 	}
@@ -158,13 +236,17 @@ func interpret(httpCode int, body string) (status string, retryable bool) {
 		return statusTaken, false
 	}
 
-	// Explicit positive signals. Quoted matching keeps a bare word like "success"
-	// appearing in unrelated prose from being read as availability.
-	if strings.Contains(low, `"success"`) {
+	// A populated errors array means the request failed; nothing in such a body
+	// is a verdict about the username.
+	if hasErrorEnvelope(low) {
+		return statusUnknown, false
+	}
+
+	// The contract's positive signal, matched as a field rather than a token.
+	if hasJSONString(low, "status", "success") {
 		return statusAvailable, false
 	}
-	if !strings.Contains(low, `"errors"`) &&
-		containsAny(low, `"is_valid":true`, `"is_valid": true`) {
+	if containsAny(low, `"is_valid":true`, `"is_valid": true`) {
 		return statusAvailable, false
 	}
 
