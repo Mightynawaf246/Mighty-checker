@@ -407,7 +407,7 @@ func TestProxyPoolEmptyIsDirect(t *testing.T) {
 // HTTP/1.1, and pinning it takes both settings: ForceAttemptHTTP2=false alone
 // still lets ALPN negotiate h2 when the runtime builds the TLS config.
 func TestDefaultTransportIsPinnedToHTTP1(t *testing.T) {
-	c := newClientCacheFor(5*time.Second, 100)
+	c := newClientCacheFor(5*time.Second, 100, 0)
 	cl, err := c.clientFor(nil)
 	if err != nil {
 		t.Fatalf("clientFor: %v", err)
@@ -423,14 +423,16 @@ func TestDefaultTransportIsPinnedToHTTP1(t *testing.T) {
 	if got := tr.TLSClientConfig.NextProtos; len(got) != 1 || got[0] != "http/1.1" {
 		t.Errorf("ALPN should offer only http/1.1, got %v", got)
 	}
-	if tr.MaxIdleConnsPerHost != 100 {
-		t.Errorf("pool should be sized from the thread count, got %d", tr.MaxIdleConnsPerHost)
+	// One proxy carries everything, so the pool is sized from the thread count.
+	if tr.MaxIdleConnsPerHost < 100 {
+		t.Errorf("a single-proxy pool should hold the whole thread count, got %d",
+			tr.MaxIdleConnsPerHost)
 	}
 }
 
 // -http2 must genuinely opt back in.
 func TestHTTP2FlagOptsBackIn(t *testing.T) {
-	c := newClientCacheFor(5*time.Second, 100).withHTTP2(true)
+	c := newClientCacheFor(5*time.Second, 100, 0).withHTTP2(true)
 	cl, err := c.clientFor(nil)
 	if err != nil {
 		t.Fatalf("clientFor: %v", err)
@@ -473,7 +475,7 @@ func TestPoolOpensConcurrentConnections(t *testing.T) {
 	srv.Start()
 	defer srv.Close()
 
-	cl, err := newClientCacheFor(5*time.Second, concurrent).clientFor(nil)
+	cl, err := newClientCacheFor(5*time.Second, concurrent, 0).clientFor(nil)
 	if err != nil {
 		t.Fatalf("clientFor: %v", err)
 	}
@@ -636,4 +638,50 @@ func TestProxyPoolReprobesSkippedProxies(t *testing.T) {
 	if used > 100 {
 		t.Errorf("the slow proxy is being probed too often: %d/500", used)
 	}
+}
+
+// The connection pool is per proxy, so sizing it from the thread count alone
+// multiplies across the pool: -t 2000 over 200 proxies told each of 200
+// transports it could hold 2000 idle connections - a budget of 1.6 million
+// sockets, against a Linux default of 1024 open files and a Windows dynamic
+// port range of about 16000.
+func TestIdleBudgetScalesWithTheProxyCount(t *testing.T) {
+	cases := []struct{ threads, proxies int }{
+		{500, 50}, {2000, 200}, {4000, 400}, {1000, 1},
+	}
+	for _, c := range cases {
+		cache := newClientCacheFor(10*time.Second, c.threads, c.proxies)
+		spec, err := parseProxy("http://1.2.3.4:8080")
+		if err != nil {
+			t.Fatal(err)
+		}
+		cl, err := cache.clientFor(spec)
+		if err != nil {
+			t.Fatal(err)
+		}
+		tr := cl.Transport.(*http.Transport)
+
+		total := tr.MaxIdleConns * c.proxies
+		t.Logf("-t %d over %d proxies: %d idle/host, %d total",
+			c.threads, c.proxies, tr.MaxIdleConnsPerHost, total)
+
+		// Each proxy needs its share of the work plus headroom, not the whole
+		// thread count.
+		share := c.threads / max(1, c.proxies)
+		if tr.MaxIdleConnsPerHost < share {
+			t.Errorf("-t %d over %d proxies: %d idle/host is below the %d share",
+				c.threads, c.proxies, tr.MaxIdleConnsPerHost, share)
+		}
+		if total > 60_000 {
+			t.Errorf("-t %d over %d proxies budgets %d sockets - far past any file limit",
+				c.threads, c.proxies, total)
+		}
+	}
+}
+
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }

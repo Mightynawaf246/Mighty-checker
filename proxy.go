@@ -564,7 +564,7 @@ type clientCache struct {
 }
 
 func newClientCache(timeout time.Duration) *clientCache {
-	return newClientCacheFor(timeout, 0)
+	return newClientCacheFor(timeout, 0, 0)
 }
 
 // withHTTP2 opts the cache into HTTP/2. Call before any client is built.
@@ -574,10 +574,42 @@ func (c *clientCache) withHTTP2(on bool) *clientCache {
 }
 
 // newClientCacheFor sizes the connection pools for a given worker count.
-func newClientCacheFor(timeout time.Duration, threads int) *clientCache {
-	idle := threads
-	if idle < 64 {
-		idle = 64
+// newClientCacheFor sizes the connection pools for a worker count spread over a
+// proxy count.
+//
+// The pool is per proxy, because each proxy gets its own Transport. Sizing it
+// from the thread count alone therefore multiplies: -t 2000 over 200 proxies
+// told every one of the 200 transports it could hold 2000 idle connections -
+// a budget of 1.6 million sockets, against a Linux default of 1024 open files
+// and a Windows dynamic port range of about 16000. The run does not open them
+// all at once, but nothing stopped it trying, and "too many open files" or an
+// exhausted port range ends the run rather than slowing it.
+//
+// What each proxy actually needs is the share of the work that reaches it, plus
+// headroom for the bursts that round-robin produces.
+func newClientCacheFor(timeout time.Duration, threads, proxies int) *clientCache {
+	share := threads
+	if proxies > 1 {
+		share = threads/proxies + 1
+	}
+	idle := share * 2 // headroom for uneven arrival
+
+	// Two ceilings, for two different failure modes. The per-host one stops a
+	// single proxy from being told to hold an absurd number; the pool-wide one
+	// stops the multiplication across many transports, which is the case that
+	// actually reached the millions.
+	const (
+		maxIdlePerHost = 2048
+		maxIdleBudget  = 50000
+	)
+	if idle > maxIdlePerHost {
+		idle = maxIdlePerHost
+	}
+	if proxies > 1 && idle*proxies > maxIdleBudget {
+		idle = maxIdleBudget / proxies
+	}
+	if idle < 8 {
+		idle = 8
 	}
 	return &clientCache{
 		clients:     make(map[string]*http.Client),

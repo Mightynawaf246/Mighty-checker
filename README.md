@@ -210,6 +210,19 @@ the same hundred hits cost **505ms once**. The names are already durable in
 `available.txt` and already out of rotation before the file catches up, so the
 delay costs nothing — the file only decides what a *future* run starts from.
 
+**The list is only re-read when it changes.** It is re-read so you can edit it
+mid-run, but parsing two million names costs 1.42s and 460MB per check — 28% of
+a core and five gigabytes a minute of garbage, permanently, to discover almost
+every time that nothing had changed. A `stat` decides first: an unchanged tick
+now costs **1.5µs and 272 bytes**.
+
+**Connection pools are sized per proxy, not per thread.** Each proxy gets its
+own transport, so sizing the idle pool from `-t` alone multiplied across the
+pool: `-t 2000` over 200 proxies budgeted **1.6 million sockets**, against a
+Linux default of 1024 open files and a Windows dynamic port range near 16 000.
+It now budgets each proxy its share plus headroom — 17 600 total for that same
+configuration — so a large run does not end in `too many open files`.
+
 **A single pass keeps no dedupe state.** Skipping a repeated result only matters
 while looping, where a name comes round again. One pass asks about each name
 exactly once, so the map that made that possible cost an entry per result for

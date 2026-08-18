@@ -27,7 +27,7 @@ func TestProxyCheckMarksDeadProxies(t *testing.T) {
 	pool := newProxyPool(specs)
 	cfg := &config{threads: 8, timeout: 2 * time.Second, outDir: t.TempDir(), quiet: true}
 
-	reports := checkProxies(context.Background(), pool, newClientCacheFor(cfg.timeout, 8), cfg, nil)
+	reports := checkProxies(context.Background(), pool, newClientCacheFor(cfg.timeout, 8, 0), cfg, nil)
 	if len(reports) != 2 {
 		t.Fatalf("want a report per proxy, got %d", len(reports))
 	}
@@ -49,7 +49,7 @@ func TestProxyCheckEmptyPool(t *testing.T) {
 	pool := newProxyPool(nil)
 	cfg := &config{threads: 8, timeout: time.Second, outDir: t.TempDir(), quiet: true}
 
-	reports := checkProxies(context.Background(), pool, newClientCacheFor(cfg.timeout, 8), cfg, nil)
+	reports := checkProxies(context.Background(), pool, newClientCacheFor(cfg.timeout, 8, 0), cfg, nil)
 	if len(reports) != 0 {
 		t.Errorf("want no reports for an empty pool, got %d", len(reports))
 	}
@@ -74,7 +74,7 @@ func TestProxyCheckHonoursCancellation(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		checkProxies(ctx, pool, newClientCacheFor(cfg.timeout, 4), cfg, nil)
+		checkProxies(ctx, pool, newClientCacheFor(cfg.timeout, 4, 0), cfg, nil)
 		close(done)
 	}()
 	select {
@@ -249,7 +249,7 @@ func TestLatencySplitAttribution(t *testing.T) {
 	t.Cleanup(srv.Close)
 	withEndpoint(t, srv.URL)
 
-	rep := testProxy(context.Background(), nil, newClientCacheFor(5*time.Second, 4), 5*time.Second)
+	rep := testProxy(context.Background(), nil, newClientCacheFor(5*time.Second, 4, 0), 5*time.Second)
 	if !rep.ok {
 		t.Fatalf("expected a clean answer, got %q", rep.reason)
 	}

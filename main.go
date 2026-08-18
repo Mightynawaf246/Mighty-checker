@@ -112,10 +112,6 @@ type tally struct {
 	// Error causes, grouped so the user can see what actually needs fixing.
 	// Owned by the writer goroutine alone, so no lock is needed.
 	reasons map[string]int
-
-	// found lists the usernames that came back available this round, so the
-	// caller can drop them from the working list and stop re-checking them.
-	found []string
 }
 
 func (t *tally) addReason(r string) {
@@ -143,10 +139,6 @@ func (t *tally) add(o tally) {
 		}
 		t.reasons[r] += n
 	}
-	// found is deliberately NOT accumulated here. The caller consumes it per
-	// round to prune the usernames file; carrying every hit of the whole run
-	// forward only grows a slice nobody reads, and it is copied wholesale on
-	// every status refresh.
 }
 
 // resultSink owns the result files. Created once and kept across loop rounds,
@@ -428,7 +420,7 @@ func main() {
 	// and -target may change the thread count afterwards, which is what the
 	// run's connection pools are sized from.
 	if pool.len() > 0 && !cfg.noProxyCheck {
-		pre := newClientCacheFor(cfg.timeout, 64).withHTTP2(cfg.http2)
+		pre := newClientCacheFor(cfg.timeout, 64, pool.len()).withHTTP2(cfg.http2)
 		reports := checkProxies(ctx, pool, pre, cfg, newConsole(cfg))
 		alive := printProxyReport(cfg, reports)
 		pre.closeIdle()
@@ -469,7 +461,7 @@ func main() {
 			"running with -t %d as given", cfg.threads)
 	}
 
-	cache := newClientCacheFor(cfg.timeout, cfg.threads).withHTTP2(cfg.http2)
+	cache := newClientCacheFor(cfg.timeout, cfg.threads, pool.len()).withHTTP2(cfg.http2)
 	defer cache.closeIdle()
 
 	// One limiter for the whole run, so what it learns about the endpoint's
@@ -1446,7 +1438,6 @@ func handleResult(res result, cfg *config, con *console,
 	switch res.status {
 	case statusAvailable:
 		counts.available++
-		counts.found = append(counts.found, res.username)
 		record("available", res.username)
 		// Make the hit durable now. Hits are rare and irreplaceable, and a
 		// round can run for hours; leaving them in a 4KB buffer meant a dropped
@@ -1902,6 +1893,18 @@ func watchList(ctx context.Context, cfg *config, wl *worklist) {
 	t := time.NewTicker(every)
 	defer t.Stop()
 
+	// Only re-read when the file has actually changed.
+	//
+	// Parsing it unconditionally every tick is not cheap at scale: two million
+	// names cost 1.42s and 460MB of allocation per tick, which is 28% of a core
+	// and five gigabytes a minute of garbage - permanently, to discover almost
+	// every time that nothing had changed. A stat is free by comparison.
+	var lastMod time.Time
+	var lastSize int64
+	if st, err := os.Stat(cfg.usernamesFile); err == nil {
+		lastMod, lastSize = st.ModTime(), st.Size()
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -1909,26 +1912,21 @@ func watchList(ctx context.Context, cfg *config, wl *worklist) {
 		case <-t.C:
 		}
 
+		st, err := os.Stat(cfg.usernamesFile)
+		if err != nil {
+			continue
+		}
+		if st.ModTime().Equal(lastMod) && st.Size() == lastSize {
+			continue
+		}
+		lastMod, lastSize = st.ModTime(), st.Size()
+
 		names, err := loadLines(cfg.usernamesFile)
 		if err != nil || len(names) == 0 {
 			// A momentarily unreadable or empty file is not a reason to throw
 			// away a running watch list; the next tick tries again.
 			continue
 		}
-		if !sameNames(names, wl.snapshot()) {
-			wl.replace(names)
-		}
+		wl.replace(names)
 	}
-}
-
-func sameNames(a, b []string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
 }

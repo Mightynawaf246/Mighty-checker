@@ -498,7 +498,7 @@ func TestWatchesNamesUntilTheyFreeUp(t *testing.T) {
 	done := make(chan tally, 1)
 	go func() {
 		done <- runPipeline(ctx, wl, newProxyPool(nil),
-			newClientCacheFor(cfg.timeout, cfg.threads), cfg, sink,
+			newClientCacheFor(cfg.timeout, cfg.threads, 0), cfg, sink,
 			&liveStats{}, newAdaptiveLimiter(cfg.threads, true), pruner, time.Now())
 	}()
 
@@ -691,19 +691,28 @@ func TestRemoveFromListNoopKeepsFileByteIdentical(t *testing.T) {
 	}
 }
 
-// The pipeline must report which names were available so the caller can drop them.
-func TestTallyReportsFoundNames(t *testing.T) {
+// The available name, and only it, must reach available.txt - that file is what
+// the pruner and the next run both work from.
+func TestOnlyAvailableNamesAreRecorded(t *testing.T) {
 	srv := fakeInstagram(t, nil)
 	withEndpoint(t, srv.URL)
 
+	dir := t.TempDir()
 	cfg := &config{threads: 2, timeout: 5 * time.Second, retries: 1,
-		outDir: t.TempDir(), quiet: true}
+		outDir: dir, quiet: true}
 
 	counts := runOnce(context.Background(),
 		[]string{"freeuser", "takenuser"}, newProxyPool(nil), cfg)
 
-	if len(counts.found) != 1 || counts.found[0] != "freeuser" {
-		t.Fatalf("found: want [freeuser], got %v", counts.found)
+	if counts.available != 1 || counts.taken != 1 {
+		t.Fatalf("want 1 available and 1 taken, got %+v", counts)
+	}
+	got, err := os.ReadFile(filepath.Join(dir, "available.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lines := strings.Fields(string(got)); len(lines) != 1 || lines[0] != "freeuser" {
+		t.Errorf("available.txt = %q, want just freeuser", string(got))
 	}
 }
 
@@ -774,9 +783,6 @@ func TestConfirmedAvailableIsReported(t *testing.T) {
 	if counts.available != 1 {
 		t.Errorf("want 1 available, got %+v", counts)
 	}
-	if len(counts.found) != 1 || counts.found[0] != "someuser" {
-		t.Errorf("found list: %v", counts.found)
-	}
 	if got := hits.Load(); got != 2 {
 		t.Errorf("want exactly 2 requests, got %d", got)
 	}
@@ -788,15 +794,21 @@ func TestUnconfirmableAvailableBecomesUnknown(t *testing.T) {
 	srv := scriptedEndpoint(t, nil, bodyAvailable, bodyGarbage)
 	withEndpoint(t, srv.URL)
 
+	dir := t.TempDir()
 	cfg := &config{threads: 1, timeout: 5 * time.Second, retries: 1,
-		outDir: t.TempDir(), quiet: true}
+		outDir: dir, quiet: true}
 	counts := runOnce(context.Background(), []string{"someuser"}, newProxyPool(nil), cfg)
 
 	if counts.available != 0 || counts.unknown != 1 {
 		t.Errorf("want the name reported unknown, got %+v", counts)
 	}
-	if len(counts.found) != 0 {
-		t.Errorf("an unconfirmed name must not be moved to available.txt: %v", counts.found)
+	// And it must not reach the file the pruner deletes from the list on.
+	got, err := os.ReadFile(filepath.Join(dir, "available.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(string(got)) != "" {
+		t.Errorf("an unconfirmed name reached available.txt: %q", string(got))
 	}
 }
 
@@ -902,7 +914,7 @@ func TestUnknownAnswersDoNotCutConcurrency(t *testing.T) {
 
 	sink := newResultSink(cfg)
 	counts := runPipeline(context.Background(), newWorklist(usernames, cfg.loop), newProxyPool(nil),
-		newClientCacheFor(cfg.timeout, cfg.threads), cfg, sink, &liveStats{}, lim, nil, time.Now())
+		newClientCacheFor(cfg.timeout, cfg.threads, 0), cfg, sink, &liveStats{}, lim, nil, time.Now())
 	sink.close()
 
 	if counts.unknown != len(usernames) {
@@ -933,7 +945,7 @@ func TestThrottleResponsesCutConcurrency(t *testing.T) {
 
 	sink := newResultSink(cfg)
 	runPipeline(context.Background(), newWorklist(usernames, cfg.loop), newProxyPool(nil),
-		newClientCacheFor(cfg.timeout, cfg.threads), cfg, sink, &liveStats{}, lim, nil, time.Now())
+		newClientCacheFor(cfg.timeout, cfg.threads, 0), cfg, sink, &liveStats{}, lim, nil, time.Now())
 	sink.close()
 
 	if got := lim.current(); got >= cfg.threads {
@@ -987,7 +999,7 @@ func TestNoAdaptKeepsFullConcurrencyUnderThrottling(t *testing.T) {
 
 	sink := newResultSink(cfg)
 	counts := runPipeline(context.Background(), newWorklist(usernames, cfg.loop), newProxyPool(nil),
-		newClientCacheFor(cfg.timeout, cfg.threads), cfg, sink, &liveStats{}, lim, nil, time.Now())
+		newClientCacheFor(cfg.timeout, cfg.threads, 0), cfg, sink, &liveStats{}, lim, nil, time.Now())
 	sink.close()
 
 	if counts.total() != len(usernames) {

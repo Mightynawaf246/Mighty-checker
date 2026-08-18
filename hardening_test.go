@@ -284,15 +284,33 @@ func TestTallyAddDoesNotAliasReasons(t *testing.T) {
 	}
 }
 
-// found is consumed per round; accumulating it forever only grows a slice
-// nobody reads and copies it on every status tick.
-func TestTallyAddDoesNotAccumulateFound(t *testing.T) {
+// A long run must not retain anything per hit. The tally holds counters and an
+// error breakdown; the hits themselves are durable in available.txt and queued
+// in the pruner, so keeping a copy here as well only grows with the run.
+func TestTallyRetainsNothingPerResult(t *testing.T) {
+	var counts tally
+	record := func(string, string) {}
+	flush := func(string) {}
+	cfg := &config{quiet: true}
+	con := newConsole(cfg)
+
+	const hits = 50000
+	for i := 0; i < hits; i++ {
+		handleResult(result{username: fmt.Sprintf("hit%d", i), status: statusAvailable},
+			cfg, con, &counts, record, flush, nil)
+	}
+	if counts.available != hits {
+		t.Fatalf("counted %d hits, want %d", counts.available, hits)
+	}
+
+	// The only map is the error breakdown, and nothing errored.
+	if len(counts.reasons) != 0 {
+		t.Errorf("%d error reasons retained for a clean run", len(counts.reasons))
+	}
+
 	var grand tally
 	for i := 0; i < 5; i++ {
-		grand.add(tally{available: 1, found: []string{fmt.Sprintf("n%d", i)}})
-	}
-	if len(grand.found) != 0 {
-		t.Errorf("grand.found grew to %d entries", len(grand.found))
+		grand.add(tally{available: 1})
 	}
 	if grand.available != 5 {
 		t.Errorf("counts must still accumulate, got %d", grand.available)
@@ -515,7 +533,7 @@ func TestThrottlingDoesNotEmptyTheProxyPool(t *testing.T) {
 	}
 	sink := newResultSink(cfg)
 	runPipeline(context.Background(), newWorklist(names, cfg.loop), pool,
-		newClientCacheFor(cfg.timeout, cfg.threads), cfg, sink, &liveStats{}, newAdaptiveLimiter(cfg.threads, true), nil, time.Now())
+		newClientCacheFor(cfg.timeout, cfg.threads, 0), cfg, sink, &liveStats{}, newAdaptiveLimiter(cfg.threads, true), nil, time.Now())
 	sink.close()
 
 	// Nothing to quarantine with a direct connection, but the accounting must
@@ -670,7 +688,7 @@ func TestKeepListDoesNotRepeatAHit(t *testing.T) {
 	defer cancel()
 
 	counts := runPipeline(ctx, wl, newProxyPool(nil),
-		newClientCacheFor(cfg.timeout, cfg.threads), cfg, sink, &liveStats{},
+		newClientCacheFor(cfg.timeout, cfg.threads, 0), cfg, sink, &liveStats{},
 		newAdaptiveLimiter(cfg.threads, true), nil, time.Now())
 	sink.close()
 
@@ -708,7 +726,7 @@ func TestFoundNameLeavesRotationAndFile(t *testing.T) {
 
 	pruner := newListPruner(ctx, cfg, sink)
 	counts := runPipeline(ctx, wl, newProxyPool(nil),
-		newClientCacheFor(cfg.timeout, cfg.threads), cfg, sink, &liveStats{},
+		newClientCacheFor(cfg.timeout, cfg.threads, 0), cfg, sink, &liveStats{},
 		newAdaptiveLimiter(cfg.threads, true), pruner, time.Now())
 	pruner.stop() // flushes the batch
 	sink.close()
@@ -803,7 +821,7 @@ func TestLatencyInstrumentTracksASlowdown(t *testing.T) {
 		sample <- read()
 	}()
 
-	runPipeline(ctx, wl, newProxyPool(nil), newClientCacheFor(cfg.timeout, cfg.threads),
+	runPipeline(ctx, wl, newProxyPool(nil), newClientCacheFor(cfg.timeout, cfg.threads, 0),
 		cfg, sink, stats, newAdaptiveLimiter(cfg.threads, true), nil, time.Now())
 	sink.close()
 
@@ -890,7 +908,7 @@ func TestRespectingProxyCapacityBeatsBruteForce(t *testing.T) {
 		defer cancel()
 
 		start := time.Now()
-		runPipeline(ctx, wl, newProxyPool(nil), newClientCacheFor(cfg.timeout, threads),
+		runPipeline(ctx, wl, newProxyPool(nil), newClientCacheFor(cfg.timeout, threads, 0),
 			cfg, sink, stats, lim, nil, start)
 		el := time.Since(start)
 		sink.close()
@@ -1133,4 +1151,49 @@ func TestSinglePassDoesNotAccumulateDedupeState(t *testing.T) {
 		t.Errorf("loop mode dedupe entries: %d, want 1", got)
 	}
 	loop.close()
+}
+
+// The usernames file is re-read so it can be edited mid-run, but parsing it
+// unconditionally every few seconds is not cheap at scale: two million names
+// cost 1.42s and 460MB of allocation per tick - 28% of a core and five
+// gigabytes a minute of garbage, permanently, to discover almost every time
+// that nothing had changed. It must only re-read when the file actually moved.
+func TestWatchListOnlyReloadsOnChange(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "username.txt")
+	if err := os.WriteFile(path, []byte("alpha\nbeta\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &config{usernamesFile: path, quiet: true, loop: true}
+	wl := newWorklist([]string{"alpha", "beta"}, true)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go watchList(ctx, cfg, wl)
+
+	// Retire one name from the rotation WITHOUT touching the file. A watcher
+	// that reloads unconditionally would put it back.
+	wl.retire("alpha")
+	if got := wl.size(); got != 1 {
+		t.Fatalf("setup: %d live", got)
+	}
+
+	time.Sleep(300 * time.Millisecond)
+	if got := wl.size(); got != 1 {
+		t.Errorf("the watcher reloaded an unchanged file and resurrected a name: %d live", got)
+	}
+
+	// Now change the file for real; the watcher must pick it up.
+	if err := os.WriteFile(path, []byte("alpha\nbeta\ngamma\ndelta\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		if wl.size() == 3 { // gamma + delta + beta; alpha stays retired
+			return
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	t.Errorf("the watcher never picked up a real edit: %d live", wl.size())
 }
