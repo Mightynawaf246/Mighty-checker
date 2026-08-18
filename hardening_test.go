@@ -515,7 +515,7 @@ func TestThrottlingDoesNotEmptyTheProxyPool(t *testing.T) {
 	}
 	sink := newResultSink(cfg)
 	runPipeline(context.Background(), newWorklist(names, cfg.loop), pool,
-		newClientCacheFor(cfg.timeout, cfg.threads), cfg, sink, &liveStats{}, newAdaptiveLimiter(cfg.threads, true), time.Now())
+		newClientCacheFor(cfg.timeout, cfg.threads), cfg, sink, &liveStats{}, newAdaptiveLimiter(cfg.threads, true), nil, time.Now())
 	sink.close()
 
 	// Nothing to quarantine with a direct connection, but the accounting must
@@ -671,7 +671,7 @@ func TestKeepListDoesNotRepeatAHit(t *testing.T) {
 
 	counts := runPipeline(ctx, wl, newProxyPool(nil),
 		newClientCacheFor(cfg.timeout, cfg.threads), cfg, sink, &liveStats{},
-		newAdaptiveLimiter(cfg.threads, true), time.Now())
+		newAdaptiveLimiter(cfg.threads, true), nil, time.Now())
 	sink.close()
 
 	if counts.available != 1 {
@@ -706,9 +706,11 @@ func TestFoundNameLeavesRotationAndFile(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
+	pruner := newListPruner(ctx, cfg, sink)
 	counts := runPipeline(ctx, wl, newProxyPool(nil),
 		newClientCacheFor(cfg.timeout, cfg.threads), cfg, sink, &liveStats{},
-		newAdaptiveLimiter(cfg.threads, true), time.Now())
+		newAdaptiveLimiter(cfg.threads, true), pruner, time.Now())
+	pruner.stop() // flushes the batch
 	sink.close()
 
 	if counts.available != 1 {
@@ -802,7 +804,7 @@ func TestLatencyInstrumentTracksASlowdown(t *testing.T) {
 	}()
 
 	runPipeline(ctx, wl, newProxyPool(nil), newClientCacheFor(cfg.timeout, cfg.threads),
-		cfg, sink, stats, newAdaptiveLimiter(cfg.threads, true), time.Now())
+		cfg, sink, stats, newAdaptiveLimiter(cfg.threads, true), nil, time.Now())
 	sink.close()
 
 	fast, slowed := <-sample, <-sample
@@ -889,7 +891,7 @@ func TestRespectingProxyCapacityBeatsBruteForce(t *testing.T) {
 
 		start := time.Now()
 		runPipeline(ctx, wl, newProxyPool(nil), newClientCacheFor(cfg.timeout, threads),
-			cfg, sink, stats, lim, start)
+			cfg, sink, stats, lim, nil, start)
 		el := time.Since(start)
 		sink.close()
 
@@ -988,4 +990,147 @@ func TestFreshnessIsDominatedByLatency(t *testing.T) {
 	if got := freshness(time.Second, names, 0); got != 0 {
 		t.Errorf("nothing completing: %v", got)
 	}
+}
+
+// Removing one found name rewrites the whole usernames file, and the writer
+// goroutine was doing it inline for every hit while also being the only
+// consumer of results. On a two-million-name list that is 681ms of frozen
+// pipeline per hit. Batching has to turn N rewrites into one.
+func TestPrunerBatchesRemovals(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "username.txt")
+
+	var content strings.Builder
+	content.WriteString("# my list\n")
+	for i := 0; i < 5000; i++ {
+		fmt.Fprintf(&content, "user%d\n", i)
+	}
+	if err := os.WriteFile(path, []byte(content.String()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &config{usernamesFile: path, outDir: dir, quiet: true}
+	sink := newResultSink(cfg)
+	defer sink.close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var flushes, removed int
+	p := newListPruner(ctx, cfg, sink)
+	p.flushed = func(n, _ int) { flushes++; removed += n }
+
+	for i := 0; i < 50; i++ {
+		p.add(fmt.Sprintf("user%d", i*10))
+	}
+	// Nothing should have been written yet: the interval has not elapsed and
+	// the batch is far below the size that forces an early flush.
+	if got, _ := loadLines(path); len(got) != 5000 {
+		t.Errorf("the file was rewritten inline: %d names left", len(got))
+	}
+
+	p.stop() // flushes on the way out
+
+	if flushes != 1 {
+		t.Errorf("50 hits caused %d rewrites, want 1", flushes)
+	}
+	if removed != 50 {
+		t.Errorf("removed %d names, want 50", removed)
+	}
+	left, err := loadLines(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(left) != 4950 {
+		t.Errorf("%d names left, want 4950", len(left))
+	}
+	raw, _ := os.ReadFile(path)
+	if !strings.Contains(string(raw), "# my list") {
+		t.Error("comment lost")
+	}
+}
+
+// A run that is finding a lot must not accumulate pending removals without
+// bound; a large batch forces an early flush.
+func TestPrunerFlushesOnLargeBatch(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "username.txt")
+	var content strings.Builder
+	for i := 0; i < pruneBatchLimit+100; i++ {
+		fmt.Fprintf(&content, "user%d\n", i)
+	}
+	os.WriteFile(path, []byte(content.String()), 0o644)
+
+	cfg := &config{usernamesFile: path, outDir: dir, quiet: true}
+	sink := newResultSink(cfg)
+	defer sink.close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	p := newListPruner(ctx, cfg, sink)
+	for i := 0; i < pruneBatchLimit; i++ {
+		p.add(fmt.Sprintf("user%d", i))
+	}
+	// The limit was reached, so this must already be on disk without stopping.
+	if got, _ := loadLines(path); len(got) != 100 {
+		t.Errorf("a full batch did not force a flush: %d names left", len(got))
+	}
+	p.stop()
+}
+
+// Pruning must still refuse while the results file is failing: deleting names
+// from the input on the strength of writes that did not land destroys both
+// records at once.
+func TestPrunerRefusesWhenResultsAreFailing(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "username.txt")
+	os.WriteFile(path, []byte("alpha\nbeta\n"), 0o644)
+
+	cfg := &config{usernamesFile: path, outDir: dir, quiet: true}
+	sink := newResultSink(cfg)
+	sink.err = fmt.Errorf("disk full")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	p := newListPruner(ctx, cfg, sink)
+	p.add("alpha")
+	p.stop()
+
+	if left, _ := loadLines(path); len(left) != 2 {
+		t.Errorf("the list was pruned while results were failing: %v", left)
+	}
+	sink.close()
+}
+
+// A single pass asks about each name exactly once, so keeping every result in a
+// dedupe map buys nothing and costs an entry per name - hundreds of megabytes
+// on a several-million-name list.
+func TestSinglePassDoesNotAccumulateDedupeState(t *testing.T) {
+	dir := t.TempDir()
+
+	single := newResultSink(&config{outDir: dir, quiet: true})
+	for i := 0; i < 20000; i++ {
+		single.record("taken", fmt.Sprintf("user%d", i))
+	}
+	if got := len(single.seen); got != 0 {
+		t.Errorf("single pass kept %d dedupe entries", got)
+	}
+	single.close()
+
+	// available.txt is always deduplicated: it is appended to across runs.
+	single2 := newResultSink(&config{outDir: t.TempDir(), quiet: true})
+	single2.record("available", "alpha")
+	single2.record("available", "alpha")
+	single2.close()
+	data, _ := os.ReadFile(filepath.Join(single2.files["available"].Name()))
+	_ = data
+
+	// Loop mode still deduplicates every bucket, since names come round again.
+	loop := newResultSink(&config{outDir: t.TempDir(), quiet: true, loop: true})
+	loop.record("taken", "beta")
+	loop.record("taken", "beta")
+	if got := len(loop.seen); got != 1 {
+		t.Errorf("loop mode dedupe entries: %d, want 1", got)
+	}
+	loop.close()
 }

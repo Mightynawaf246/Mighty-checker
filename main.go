@@ -154,7 +154,13 @@ func (t *tally) add(o tally) {
 type resultSink struct {
 	files   map[string]*os.File
 	writers map[string]*bufio.Writer
-	seen    map[string]bool // prevents repeating the same line across rounds
+	// seen prevents repeating the same line. It is only needed where a name can
+	// be answered more than once - that is, while looping. A single pass asks
+	// about each name exactly once, so keeping every result in a map there buys
+	// nothing and costs a map entry per name: on a several-million-name list
+	// that is hundreds of megabytes of pure bookkeeping.
+	seen  map[string]bool
+	dedup bool
 
 	// err latches the first write failure. Every write used to discard its
 	// error, so a full disk produced a run that reported hits on screen, fired
@@ -168,6 +174,7 @@ func newResultSink(cfg *config) *resultSink {
 		files:   map[string]*os.File{},
 		writers: map[string]*bufio.Writer{},
 		seen:    map[string]bool{},
+		dedup:   cfg.loop,
 	}
 	for _, name := range []string{"available", "taken", "unknown", "errors"} {
 		path := outPath(cfg, name+".txt")
@@ -215,13 +222,18 @@ func (s *resultSink) loadSeen(bucket, path string) {
 	}
 }
 
-// record writes a line to its bucket, skipping duplicates across rounds.
+// record writes a line to its bucket, skipping duplicates.
 func (s *resultSink) record(bucket, line string) {
-	key := bucket + "\x00" + line
-	if s.seen[key] {
-		return
+	// available.txt is always deduplicated: it is appended to across runs, so a
+	// name already in it must not be written again. The others only need it
+	// while looping, where the same name comes round repeatedly.
+	if s.dedup || bucket == "available" {
+		key := bucket + "\x00" + line
+		if s.seen[key] {
+			return
+		}
+		s.seen[key] = true
 	}
-	s.seen[key] = true
 	if w, ok := s.writers[bucket]; ok {
 		if _, err := fmt.Fprintln(w, line); err != nil && s.err == nil {
 			s.err = fmt.Errorf("writing to %s.txt: %w", bucket, err)
@@ -486,7 +498,19 @@ func main() {
 	stats := &liveStats{}
 	start := time.Now()
 
-	counts := runPipeline(ctx, wl, pool, cache, cfg, sink, stats, lim, start)
+	// Found names leave the usernames file in batches, off the result path.
+	var pruner *listPruner
+	if !cfg.keepList {
+		pruner = newListPruner(ctx, cfg, sink)
+		pruner.flushed = func(removed, remaining int) {
+			fmt.Printf("%s %s\n",
+				cGreen(fmt.Sprintf("[+] moved %d name(s) out of %s", removed, cfg.usernamesFile)),
+				cGray(fmt.Sprintf("- %d left", remaining)))
+		}
+	}
+
+	counts := runPipeline(ctx, wl, pool, cache, cfg, sink, stats, lim, pruner, start)
+	pruner.stop()
 	sink.flush()
 
 	elapsed := time.Since(start)
@@ -911,7 +935,7 @@ func printSummary(cfg *config, counts tally, elapsed time.Duration, interrupted 
 // wrong either truncates output silently or writes to a closed channel.
 func runPipeline(ctx context.Context, wl *worklist, pool *proxyPool,
 	cache *clientCache, cfg *config, sink *resultSink, stats *liveStats,
-	lim *adaptiveLimiter, start time.Time) tally {
+	lim *adaptiveLimiter, pruner *listPruner, start time.Time) tally {
 
 	results := make(chan result, cfg.threads*2)
 
@@ -943,7 +967,7 @@ func runPipeline(ctx context.Context, wl *worklist, pool *proxyPool,
 	con := newConsole(cfg)
 	writerDone := make(chan tally, 1)
 	go func() {
-		writerDone <- runWriter(ctx, results, cfg, con, sink, stats, pool, lim, wl, start)
+		writerDone <- runWriter(ctx, results, cfg, con, sink, stats, pool, lim, wl, pruner, start)
 	}()
 
 	wg.Wait()
@@ -1255,7 +1279,7 @@ func effectiveConcurrency(lim *adaptiveLimiter, workers int) int {
 
 func runWriter(ctx context.Context, results <-chan result, cfg *config, con *console,
 	sink *resultSink, stats *liveStats, pool *proxyPool, lim *adaptiveLimiter,
-	wl *worklist, start time.Time) tally {
+	wl *worklist, pruner *listPruner, start time.Time) tally {
 
 	var counts tally
 
@@ -1378,10 +1402,14 @@ func runWriter(ctx context.Context, results <-chan result, cfg *config, con *con
 				if cfg.keepList {
 					con.log(cGreen(fmt.Sprintf("  + @%s recorded", res.username)) +
 						cGray(fmt.Sprintf("  - %d left (list kept)", left)))
-				} else if err := retireName(cfg, sink, res.username); err != nil {
-					warnf("cannot update %s: %v", cfg.usernamesFile, err)
 				} else {
-					con.log(cGreen(fmt.Sprintf("  + moved @%s to available.txt", res.username)) +
+					// Queued, not written: rewriting the usernames file costs
+					// most of a second on a two-million-name list, and this
+					// goroutine is also the only consumer of results. The name
+					// is already in available.txt and already out of the
+					// rotation, so the file can catch up in its own time.
+					pruner.add(res.username)
+					con.log(cGreen(fmt.Sprintf("  + @%s -> available.txt", res.username)) +
 						cGray(fmt.Sprintf("  - %d left", left)))
 				}
 				if left == 0 {
@@ -1391,17 +1419,6 @@ func runWriter(ctx context.Context, results <-chan result, cfg *config, con *con
 			}
 		}
 	}
-}
-
-// retireName removes a found name from the usernames file. It refuses while the
-// result files are failing to write: deleting a name from the input on the
-// strength of a write that did not land destroys both records of it at once.
-func retireName(cfg *config, sink *resultSink, name string) error {
-	if sink.err != nil {
-		return fmt.Errorf("results are not being written (%w); leaving the list alone", sink.err)
-	}
-	_, err := removeFromList(cfg.usernamesFile, []string{name})
-	return err
 }
 
 // handleResult classifies one result: bumps the counter, writes it to its file,

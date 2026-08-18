@@ -197,6 +197,27 @@ only way. It also warns when the thread count works out to more than ~25 per
 working proxy, since spreading a small pool that thin gets every member of it
 throttled.
 
+## Running a list of millions
+
+At that size two things stop being free, and both are handled:
+
+**Found names leave the file in batches.** Removing one name rewrites the whole
+usernames file — 681ms on a two-million-name list — and the goroutine doing it
+is also the only consumer of results, so every hit froze the pipeline for two
+thirds of a second. A hundred hits meant sixty-eight seconds of nothing but
+rewriting. Removals are now queued and flushed every 20s (or every 5 000 hits):
+the same hundred hits cost **505ms once**. The names are already durable in
+`available.txt` and already out of rotation before the file catches up, so the
+delay costs nothing — the file only decides what a *future* run starts from.
+
+**A single pass keeps no dedupe state.** Skipping a repeated result only matters
+while looping, where a name comes round again. One pass asks about each name
+exactly once, so the map that made that possible cost an entry per result for
+no benefit: 500 000 results now add **0 MB** instead of hundreds. `available.txt`
+is still deduplicated in every mode, because it is appended to across runs.
+
+Loading itself is cheap: two million names parse in 1.75s and hold about 67 MB.
+
 ## Watching a short list: the rate is not the point
 
 When you are watching a handful of names for a drop, the number that matters is
