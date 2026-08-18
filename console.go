@@ -125,6 +125,14 @@ type statusView struct {
 	Total    int           // list size for the current round
 	Counts   tally         // cumulative counters
 	Elapsed  time.Duration // time since start
+
+	// Cus is the current concurrency in use: the adaptive cap the run has
+	// settled on, which is at most -threads and drops when the endpoint pushes
+	// back. Zero means adaptation is off and every thread runs flat out.
+	Cus int
+
+	ProxiesOK  int // proxies not currently quarantined
+	ProxiesAll int // proxies loaded
 }
 
 // buildStatus renders the colored status line in the original panel style.
@@ -149,11 +157,28 @@ func buildStatus(name string, v statusView) string {
 		progress = fmt.Sprintf("%d/%d %d%%", v.Checked, v.Total, pct)
 	}
 
-	return head + " " +
+	line := head + " " +
 		seg("RPS", fmt.Sprintf("%d", v.RPS)) + sep +
 		seg("UPS", fmt.Sprintf("%d", v.UPS)) + sep +
 		seg("Att", fmt.Sprintf("%d", v.Attempts)) + sep +
-		seg("Chk", progress) + sep +
+		seg("Chk", progress) + sep
+
+	// CUS = concurrency in use, the live adaptive cap. Shown only when
+	// adaptation is on, since a fixed cap tells the user nothing.
+	if v.Cus > 0 {
+		line += seg("CUS", fmt.Sprintf("%d", v.Cus)) + sep
+	}
+	// Proxy health, shown only when proxies are in play.
+	if v.ProxiesAll > 0 {
+		px := fmt.Sprintf("%d/%d", v.ProxiesOK, v.ProxiesAll)
+		if v.ProxiesOK == v.ProxiesAll {
+			line += cGray("PX ") + cCyan(px) + sep
+		} else {
+			line += cGray("PX ") + cYellow(px) + sep
+		}
+	}
+
+	return line +
 		cGray("A ") + cGreen(fmt.Sprintf("%d", v.Counts.available)) + sep +
 		cGray("T ") + cYellow(fmt.Sprintf("%d", v.Counts.taken)) + sep +
 		cGray("U ") + cPurple(fmt.Sprintf("%d", v.Counts.unknown)) + sep +

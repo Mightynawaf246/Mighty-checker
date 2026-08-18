@@ -24,6 +24,12 @@ external dependencies** — standard library only.
 - **All proxy types** — `http`, `https`, `socks4`, `socks4a`, `socks5`,
   `socks5h`, with or without auth, rotated round-robin across workers.
 - **Real concurrency** — a goroutine worker pool with a configurable size.
+- **Adaptive speed** — the run finds the fastest rate the endpoint actually
+  answers cleanly and stays there, instead of hammering into a soft block.
+- **Confirmed hits** — an available verdict is re-checked on a second proxy
+  before it is reported, so `available.txt` holds real hits.
+- **Proxy health** — a proxy that keeps failing is quarantined and skipped
+  until it recovers, so dead proxies stop costing requests.
 - **Self-update** — the tool updates itself; no need to re-download source.
 - **Webhook** — optional notification when an available username is found.
 
@@ -109,10 +115,41 @@ Throughput is bounded by your proxies, not by threads: it is roughly
 `proxies x safe requests per proxy`. Watch the `unknown` count — above about 20%
 you are being throttled, and the summary says so.
 
+## Speed and accuracy
+
+They are not a trade-off here. Pushing past what the endpoint accepts does not
+produce more answers, it produces throttled ones, which can only be reported as
+`unknown` — so over-driving costs throughput **and** correctness at once. Three
+mechanisms keep both:
+
+**Adaptive concurrency.** `-t` is the ceiling, not the pace. The run starts at
+the full thread count and then tunes itself: a run of clean answers raises the
+live cap by one, a throttle signal cuts it by 30%. That is the same
+additive-increase / multiplicative-decrease law TCP uses for congestion, and it
+settles just below the point where throttling starts — the fastest rate that
+still yields definite answers. The live cap is the `CUS` field in the status
+line. Turn it off with `-no-adapt` if you want to drive all threads flat out.
+
+**Proxy quarantine.** Three consecutive failures put a proxy to sleep for 60
+seconds; the rotation skips it and the `PX` field shows how many are still
+healthy. A soft-blocked proxy stops burning requests instead of producing a
+stream of `unknown`. One success clears the streak, so a single blip costs
+nothing.
+
+**Confirmed availability.** A first `available` answer is re-checked through a
+different proxy before the name is reported. If the two disagree, taken wins; if
+the second check cannot be completed, the name is reported `unknown` rather than
+risking a false hit. This costs one extra request per hit only — hits are rare,
+so the throughput cost is negligible. `-no-confirm` disables it.
+
+Inconclusive answers are never accepted at face value either: an `unknown` or a
+429/5xx is retried on a different proxy, honouring `Retry-After` when the server
+sends one, with exponential backoff otherwise.
+
 ## Status line
 
 ```
-[ Mighty ] R2 | RPS 2133 | UPS 1876 | Att 219719 | Chk 4210/5000 84% | A 3 | T 900 | U 5 | E 2 | 1m43s
+[ Mighty ] R2 | RPS 2133 | UPS 1876 | Att 219719 | Chk 4210/5000 84% | CUS 380 | PX 47/50 | A 3 | T 900 | U 5 | E 2 | 1m43s
 ```
 
 | Field | Meaning |
@@ -122,6 +159,8 @@ you are being throttled, and the summary says so.
 | `UPS` | usernames checked per second |
 | `Att` | total requests sent |
 | `Chk` | checked out of the round total, with percentage |
+| `CUS` | concurrency in use — the live adaptive cap (hidden with `-no-adapt`) |
+| `PX` | healthy proxies out of the total (hidden without proxies) |
 | `A / T / U / E` | available / taken / unknown / errors |
 
 ## Usage
@@ -152,6 +191,8 @@ you are being throttled, and the summary says so.
 | `-out` | directory for result files | `.` |
 | `-loop` | keep re-checking until Ctrl-C | — |
 | `-keep-list` | do not remove available names from the list | — |
+| `-no-confirm` | report available names without a confirming re-check | — |
+| `-no-adapt` | disable adaptive concurrency (drive threads flat out) | — |
 | `-verbose` | log every result, not just available | — |
 | `-no-color` | disable colors and the live status line | — |
 | `-webhook` | webhook URL notified on an available name | — |
@@ -253,6 +294,8 @@ On top of that contract the classifier is deliberately conservative, so
   available.
 - If a response somehow carries both signals, **taken wins**: a false
   "available" is the costliest mistake this tool can make.
+- An **available** answer is confirmed on a second proxy before it is reported.
+  Disagreement resolves to taken; an unconfirmable hit resolves to unknown.
 
 So names in `available.txt` are trustworthy, and `unknown.txt` is what deserves
 a re-check with better proxies or a higher `-retries`.

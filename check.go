@@ -181,16 +181,28 @@ func containsAny(s string, subs ...string) bool {
 	return false
 }
 
+// response is one raw reply from the endpoint, before classification.
+type response struct {
+	code     int
+	body     string
+	location string
+
+	// retryAfter is the Retry-After header, when the endpoint sent one. It is
+	// the only reliable hint about how long a throttle will last, so waiting
+	// exactly that long beats guessing.
+	retryAfter string
+}
+
 // checkOnce performs a single check attempt through the given client.
-func checkOnce(ctx context.Context, client *http.Client, target string) (int, string, string, error) {
+func checkOnce(ctx context.Context, client *http.Client, target string) (response, error) {
 	req, err := buildRequest(ctx, target)
 	if err != nil {
-		return 0, "", "", err
+		return response{}, err
 	}
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return 0, "", "", err
+		return response{}, err
 	}
 	// The body must be drained and closed, otherwise the connection is not reused.
 	defer func() {
@@ -198,10 +210,16 @@ func checkOnce(ctx context.Context, client *http.Client, target string) (int, st
 		resp.Body.Close()
 	}()
 
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxBodyBytes))
-	if err != nil {
-		return resp.StatusCode, "", "", err
+	r := response{
+		code:       resp.StatusCode,
+		location:   resp.Header.Get("Location"),
+		retryAfter: resp.Header.Get("Retry-After"),
 	}
 
-	return resp.StatusCode, string(raw), resp.Header.Get("Location"), nil
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxBodyBytes))
+	if err != nil {
+		return r, err
+	}
+	r.body = string(raw)
+	return r, nil
 }

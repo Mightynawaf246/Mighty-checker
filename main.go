@@ -41,6 +41,8 @@ type config struct {
 	forceMenu     bool
 	debug         bool
 	keepList      bool
+	noConfirm     bool
+	noAdapt       bool
 }
 
 // liveStats holds counters written by workers and read by the status line, so
@@ -247,6 +249,10 @@ func main() {
 	cache := newClientCacheFor(cfg.timeout, cfg.threads)
 	defer cache.closeIdle()
 
+	// One limiter for the whole run, shared across rounds, so what a round
+	// learned about the endpoint's tolerance is not thrown away at the boundary.
+	lim := newAdaptiveLimiter(cfg.threads, !cfg.noAdapt)
+
 	// Result files are opened once and stay open across every loop round.
 	sink := newResultSink(cfg)
 	defer sink.close()
@@ -259,7 +265,8 @@ func main() {
 
 	for round := 1; ; round++ {
 		rounds = round
-		counts := runPipeline(ctx, usernames, pool, cache, cfg, sink, stats, round, start, grand)
+		counts := runPipeline(ctx, usernames, pool, cache, cfg, sink, stats, lim,
+			round, start, grand)
 		grand.add(counts)
 		sink.flush()
 
@@ -366,6 +373,19 @@ func printConfig(cfg *config, usernames []string, pool *proxyPool) {
 	row("Proxies", proxies)
 	row("Timeout", cCyan(cfg.timeout.String()))
 	row("Retries", cCyan(fmt.Sprintf("%d", cfg.retries)))
+
+	// The two accuracy/speed switches, stated plainly so the user always knows
+	// which mode a run was in when they read the results.
+	if cfg.noConfirm {
+		row("Confirm", cYellow("off (faster, may report false hits)"))
+	} else {
+		row("Confirm", cGreen("on (available re-checked on another proxy)"))
+	}
+	if cfg.noAdapt {
+		row("Adaptive", cYellow(fmt.Sprintf("off (all %d threads flat out)", cfg.threads)))
+	} else {
+		row("Adaptive", cGreen(fmt.Sprintf("on (up to %d, tuned to the endpoint)", cfg.threads)))
+	}
 	if cfg.webhook != "" {
 		row("Webhook", cGreen("on"))
 	}
@@ -446,7 +466,7 @@ func printSummary(cfg *config, counts tally, elapsed time.Duration, interrupted 
 // order wrong either truncates output silently or writes to a closed channel.
 func runPipeline(ctx context.Context, usernames []string, pool *proxyPool,
 	cache *clientCache, cfg *config, sink *resultSink, stats *liveStats,
-	round int, start time.Time, prior tally) tally {
+	lim *adaptiveLimiter, round int, start time.Time, prior tally) tally {
 
 	jobs := make(chan string)
 	results := make(chan result, cfg.threads*2)
@@ -464,7 +484,7 @@ func runPipeline(ctx context.Context, usernames []string, pool *proxyPool,
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			runWorker(ctx, jobs, results, pool, cache, cfg, stats)
+			runWorker(ctx, jobs, results, pool, cache, cfg, stats, lim)
 		}()
 	}
 
@@ -485,7 +505,7 @@ func runPipeline(ctx context.Context, usernames []string, pool *proxyPool,
 	con := newConsole(cfg)
 	writerDone := make(chan tally, 1)
 	go func() {
-		writerDone <- runWriter(results, cfg, con, sink, stats,
+		writerDone <- runWriter(results, cfg, con, sink, stats, pool, lim,
 			round, len(usernames), start, prior)
 	}()
 
@@ -499,7 +519,8 @@ func runPipeline(ctx context.Context, usernames []string, pool *proxyPool,
 // ---------------------------------------------------------------------- workers
 
 func runWorker(ctx context.Context, jobs <-chan string, results chan<- result,
-	pool *proxyPool, cache *clientCache, cfg *config, stats *liveStats) {
+	pool *proxyPool, cache *clientCache, cfg *config, stats *liveStats,
+	lim *adaptiveLimiter) {
 
 	for username := range jobs {
 		if ctx.Err() != nil {
@@ -511,7 +532,7 @@ func runWorker(ctx context.Context, jobs <-chan string, results chan<- result,
 			continue
 		}
 
-		res := checkWithRetries(ctx, username, pool, cache, cfg, stats)
+		res := checkWithRetries(ctx, username, pool, cache, cfg, stats, lim)
 		results <- res
 
 		if cfg.delay > 0 || cfg.jitter > 0 {
@@ -528,94 +549,190 @@ func runWorker(ctx context.Context, jobs <-chan string, results chan<- result,
 	}
 }
 
-// checkWithRetries retries a check, moving to a different proxy each attempt.
-// The original version retried on the same dead proxy.
+// attemptOnce performs one check through one proxy and reports what happened,
+// feeding proxy health and the adaptive limiter.
+type attemptOutcome struct {
+	status     string
+	code       int
+	location   string
+	body       string
+	retryAfter string
+	retryable  bool
+	err        error
+	proxy      string
+	spec       *proxySpec
+}
+
+func attemptOnce(ctx context.Context, username string, pool *proxyPool,
+	cache *clientCache, cfg *config, stats *liveStats, lim *adaptiveLimiter) attemptOutcome {
+
+	p := pool.next()
+	out := attemptOutcome{proxy: p.String(), spec: p}
+
+	client, err := cache.clientFor(p)
+	if err != nil {
+		out.err = err
+		return out
+	}
+
+	// The limiter is what keeps the request rate at the fastest level the
+	// endpoint still answers cleanly.
+	if !lim.acquire(ctx) {
+		out.err = ctx.Err()
+		return out
+	}
+	defer lim.release()
+
+	// Request deadline: with timeout=0 impose none, otherwise the context would
+	// be born already expired and every request would fail.
+	rctx := ctx
+	var cancel context.CancelFunc
+	if cfg.timeout > 0 {
+		rctx, cancel = context.WithTimeout(ctx, cfg.timeout)
+	}
+	if stats != nil {
+		stats.attempts.Add(1)
+	}
+	resp, err := checkOnce(rctx, client, username)
+	if cancel != nil {
+		cancel()
+	}
+
+	if err != nil {
+		// A transport failure is the proxy's fault, not the endpoint's, so it
+		// counts against proxy health but is not a throttle signal.
+		pool.markFail(p)
+		out.err = err
+		return out
+	}
+
+	out.code, out.body, out.location = resp.code, resp.body, resp.location
+	out.retryAfter = resp.retryAfter
+	out.status, out.retryable = interpret(resp.code, resp.body)
+
+	switch out.status {
+	case statusAvailable, statusTaken:
+		// A definite answer means this proxy works and the rate is sustainable.
+		pool.markOK(p)
+		lim.onClean()
+	default:
+		// Unknown is what a soft block looks like. Treat it as back-pressure and
+		// hold it against the proxy, so a blocked proxy is rotated out.
+		pool.markFail(p)
+		lim.onThrottle()
+	}
+	return out
+}
+
+// checkWithRetries resolves one username as definitively as it can.
+//
+// Two rules drive accuracy here:
+//   - An inconclusive answer (unknown, or a 429/5xx) is retried on a different
+//     proxy rather than accepted. Unknown usually means "this proxy is soft
+//     blocked", and a fresh one turns it into a real answer.
+//   - An "available" verdict is confirmed with a second check through a
+//     different proxy before it is reported. A false available is the costliest
+//     mistake this tool can make, and it costs one extra request only on the
+//     rare hit, so the speed cost is negligible.
 func checkWithRetries(ctx context.Context, username string, pool *proxyPool,
-	cache *clientCache, cfg *config, stats *liveStats) result {
+	cache *clientCache, cfg *config, stats *liveStats, lim *adaptiveLimiter) result {
 
 	var lastErr error
-	var lastProxy string
-	var lastCode int
-	var lastLocation string
+	var last attemptOutcome
 	sawResponse := false
 
-	for attempt := 0; attempt < cfg.retries; attempt++ {
+	// Always allow at least one extra attempt for an inconclusive answer: an
+	// unknown accepted at face value is a wrong answer, not a slow one.
+	attempts := cfg.retries
+	if attempts < 2 {
+		attempts = 2
+	}
+
+	for attempt := 0; attempt < attempts; attempt++ {
 		if ctx.Err() != nil {
 			break
 		}
 
-		p := pool.next()
-		lastProxy = p.String()
-
-		client, err := cache.clientFor(p)
-		if err != nil {
-			lastErr = err
-			continue
-		}
-
-		// Request deadline: with timeout=0 impose none, otherwise the context would
-		// be born already expired and every request would fail.
-		rctx := ctx
-		var cancel context.CancelFunc
-		if cfg.timeout > 0 {
-			rctx, cancel = context.WithTimeout(ctx, cfg.timeout)
-		}
-		if stats != nil {
-			stats.attempts.Add(1)
-		}
-		code, body, location, err := checkOnce(rctx, client, username)
-		if cancel != nil {
-			cancel()
-		}
-		if err != nil {
-			lastErr = err
+		out := attemptOnce(ctx, username, pool, cache, cfg, stats, lim)
+		if out.err != nil {
+			lastErr = out.err
+			last.proxy = out.proxy
 			continue
 		}
 
 		sawResponse = true
-		lastCode = code
-		lastLocation = location
+		last = out
 
-		status, retryable := interpret(code, body)
-		// When throttled, move to a different proxy if attempts remain.
-		if retryable && attempt < cfg.retries-1 {
+		switch out.status {
+		case statusAvailable:
+			if cfg.noConfirm {
+				return outcomeResult(username, out, cfg)
+			}
+			// Confirm on a different proxy before declaring a name free.
+			confirm := attemptOnce(ctx, username, pool, cache, cfg, stats, lim)
+			if confirm.err == nil && confirm.status == statusAvailable {
+				return outcomeResult(username, out, cfg)
+			}
+			if confirm.err == nil && confirm.status == statusTaken {
+				// The two disagree and the second says taken. Trust the negative.
+				return outcomeResult(username, confirm, cfg)
+			}
+			// Could not confirm: report unknown rather than risk a false hit.
+			out.status = statusUnknown
+			last = out
 			continue
+
+		case statusTaken:
+			return outcomeResult(username, out, cfg)
 		}
-		res := result{
-			username: username,
-			status:   status,
-			httpCode: code,
-			location: location,
-			proxy:    lastProxy,
+
+		// Unknown or throttled. Back off if the server asked us to, then retry
+		// on a different proxy.
+		if out.retryable && attempt < attempts-1 {
+			// Exponential base, overridden by Retry-After when the server sent
+			// one, and capped so a hostile header cannot stall the run.
+			base := 300 * time.Millisecond << attempt
+			wait := backoffFor(out.retryAfter, base, 5*time.Second)
+			select {
+			case <-time.After(wait):
+			case <-ctx.Done():
+				return outcomeResult(username, out, cfg)
+			}
 		}
-		if cfg.debug {
-			res.raw = body
-		}
-		return res
 	}
 
 	// Attempts exhausted on inconclusive replies (usually throttling): report
 	// unknown, not an error.
 	if sawResponse {
-		return result{
-			username: username,
-			status:   statusUnknown,
-			httpCode: lastCode,
-			location: lastLocation,
-			proxy:    lastProxy,
-		}
+		last.status = statusUnknown
+		return outcomeResult(username, last, cfg)
 	}
 
 	if lastErr == nil {
 		lastErr = errors.New("cancelled")
 	}
-	return result{username: username, status: statusError, proxy: lastProxy, err: lastErr}
+	return result{username: username, status: statusError, proxy: last.proxy, err: lastErr}
+}
+
+func outcomeResult(username string, o attemptOutcome, cfg *config) result {
+	res := result{
+		username: username,
+		status:   o.status,
+		httpCode: o.code,
+		location: o.location,
+		proxy:    o.proxy,
+	}
+	if cfg.debug {
+		res.raw = o.body
+	}
+	return res
 }
 
 // ----------------------------------------------------------------------- writer
 
 func runWriter(results <-chan result, cfg *config, con *console, sink *resultSink,
-	stats *liveStats, round, total int, start time.Time, prior tally) tally {
+	stats *liveStats, pool *proxyPool, lim *adaptiveLimiter,
+	round, total int, start time.Time, prior tally) tally {
 
 	var counts tally
 
@@ -654,15 +771,18 @@ func runWriter(results <-chan result, cfg *config, con *console, sink *resultSin
 		shown.add(counts)
 
 		con.status(buildStatus(appName, statusView{
-			Round:    round,
-			Loop:     cfg.loop,
-			RPS:      rps,
-			UPS:      ups,
-			Attempts: attempts,
-			Checked:  checked,
-			Total:    total,
-			Counts:   shown,
-			Elapsed:  now.Sub(start),
+			Round:      round,
+			Loop:       cfg.loop,
+			RPS:        rps,
+			UPS:        ups,
+			Attempts:   attempts,
+			Checked:    checked,
+			Total:      total,
+			Counts:     shown,
+			Elapsed:    now.Sub(start),
+			Cus:        lim.current(),
+			ProxiesOK:  pool.healthy(),
+			ProxiesAll: pool.len(),
 		}))
 	}
 
@@ -1016,6 +1136,10 @@ func parseFlags() *config {
 	flag.BoolVar(&cfg.debug, "debug", false, "print the raw response for every check")
 	flag.BoolVar(&cfg.keepList, "keep-list", false,
 		"do not remove available names from the usernames file")
+	flag.BoolVar(&cfg.noConfirm, "no-confirm", false,
+		"report an available name without a second confirming check")
+	flag.BoolVar(&cfg.noAdapt, "no-adapt", false,
+		"disable adaptive concurrency and drive all threads flat out")
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, `Mighty - Instagram username availability checker
@@ -1037,6 +1161,8 @@ options:
   -webhook URL          notify this webhook on an available username
   -loop                 keep re-checking the list forever until Ctrl-C
   -keep-list            do not remove available names from the usernames file
+  -no-confirm           report available names without a confirming re-check
+  -no-adapt             disable adaptive concurrency (drive threads flat out)
   -update               check for a new version and update in place
   -version              print the version and exit
   -no-update-check      skip the startup update check

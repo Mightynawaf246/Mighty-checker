@@ -6,6 +6,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestParseProxyFormats(t *testing.T) {
@@ -286,5 +287,106 @@ func TestLoadProxiesMissingFileIsNotFatal(t *testing.T) {
 	_, err := loadProxies(filepath.Join(t.TempDir(), "does-not-exist.txt"))
 	if !os.IsNotExist(err) {
 		t.Fatalf("want a not-exist error so the caller can fall back to direct, got %v", err)
+	}
+}
+
+// ------------------------------------------------------------- proxy health
+
+func testPool(t *testing.T, urls ...string) *proxyPool {
+	t.Helper()
+	var specs []*proxySpec
+	for _, u := range urls {
+		s, err := parseProxy(u)
+		if err != nil {
+			t.Fatalf("parseProxy(%q): %v", u, err)
+		}
+		specs = append(specs, s)
+	}
+	return newProxyPool(specs)
+}
+
+// A proxy that keeps failing must be quarantined and stop appearing in the
+// rotation, so a dead proxy does not keep costing requests.
+func TestProxyPoolQuarantinesRepeatedFailures(t *testing.T) {
+	pool := testPool(t, "http://1.1.1.1:8080", "http://2.2.2.2:8080")
+	bad := pool.items[0]
+
+	for i := 0; i < pool.maxFails; i++ {
+		pool.markFail(bad)
+	}
+
+	if got := pool.healthy(); got != 1 {
+		t.Fatalf("healthy after quarantine: want 1, got %d", got)
+	}
+
+	// The bad proxy must not come back out of next() while it is sleeping.
+	for i := 0; i < 20; i++ {
+		if got := pool.next(); got.key() == bad.key() {
+			t.Fatalf("quarantined proxy %s was handed out", bad)
+		}
+	}
+}
+
+// One success clears the streak, so an occasional blip never quarantines a
+// working proxy.
+func TestProxyPoolSuccessClearsFailures(t *testing.T) {
+	pool := testPool(t, "http://1.1.1.1:8080", "http://2.2.2.2:8080")
+	p := pool.items[0]
+
+	pool.markFail(p)
+	pool.markFail(p)
+	pool.markOK(p)
+	pool.markFail(p)
+
+	if got := pool.healthy(); got != 2 {
+		t.Errorf("a success must reset the streak, healthy = %d", got)
+	}
+}
+
+// When every proxy is quarantined the pool must keep handing proxies out rather
+// than stalling the run with nothing to dial through.
+func TestProxyPoolAllQuarantinedStillRotates(t *testing.T) {
+	pool := testPool(t, "http://1.1.1.1:8080", "http://2.2.2.2:8080")
+	for _, p := range pool.items {
+		for i := 0; i < pool.maxFails; i++ {
+			pool.markFail(p)
+		}
+	}
+	if got := pool.healthy(); got != 0 {
+		t.Fatalf("want every proxy quarantined, healthy = %d", got)
+	}
+	if pool.next() == nil {
+		t.Fatal("an all-quarantined pool must still return a proxy, not nil")
+	}
+}
+
+// A quarantine expires on its own, so a proxy that recovers comes back.
+func TestProxyPoolQuarantineExpires(t *testing.T) {
+	pool := testPool(t, "http://1.1.1.1:8080")
+	pool.quarantine = 10 * time.Millisecond
+
+	for i := 0; i < pool.maxFails; i++ {
+		pool.markFail(pool.items[0])
+	}
+	if got := pool.healthy(); got != 0 {
+		t.Fatalf("want the proxy quarantined, healthy = %d", got)
+	}
+
+	time.Sleep(30 * time.Millisecond)
+	if got := pool.healthy(); got != 1 {
+		t.Errorf("the quarantine should have expired, healthy = %d", got)
+	}
+}
+
+// An empty pool means "connect directly" and must never panic.
+func TestProxyPoolEmptyIsDirect(t *testing.T) {
+	pool := newProxyPool(nil)
+	if pool.next() != nil {
+		t.Error("an empty pool must return nil (direct connection)")
+	}
+	pool.markOK(nil)
+	pool.markFail(nil)
+	if pool.healthy() != 0 || pool.len() != 0 {
+		t.Error("an empty pool must report zero proxies")
 	}
 }

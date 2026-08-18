@@ -172,14 +172,33 @@ func parseProxy(line string) (*proxySpec, error) {
 
 // ----------------------------------------------------------------- proxy pool
 
-// proxyPool hands proxies to workers round-robin, safely under concurrency.
+// proxyPool hands proxies to workers round-robin, safely under concurrency, and
+// tracks the health of each one.
+//
+// Health tracking is the single biggest speed win with a real proxy list: a dead
+// proxy otherwise burns a full -timeout on every rotation. After a few
+// consecutive failures a proxy is quarantined and skipped entirely until its
+// cooldown expires, so throughput reflects the proxies that actually work.
 type proxyPool struct {
 	items []*proxySpec
 	idx   atomic.Uint64
+
+	mu       sync.Mutex
+	fails    map[string]int       // consecutive failures per proxy
+	sleeping map[string]time.Time // quarantine expiry per proxy
+
+	maxFails   int           // failures before quarantine
+	quarantine time.Duration // how long a bad proxy is skipped
 }
 
 func newProxyPool(items []*proxySpec) *proxyPool {
-	return &proxyPool{items: items}
+	return &proxyPool{
+		items:      items,
+		fails:      make(map[string]int),
+		sleeping:   make(map[string]time.Time),
+		maxFails:   3,
+		quarantine: 60 * time.Second,
+	}
 }
 
 func (p *proxyPool) len() int {
@@ -189,14 +208,73 @@ func (p *proxyPool) len() int {
 	return len(p.items)
 }
 
-// next returns the next proxy in rotation, or nil when there are none (meaning
-// a direct connection). Avoids dividing by zero.
+// next returns the next healthy proxy in rotation, or nil when there are none
+// (meaning a direct connection). Quarantined proxies are skipped; if every proxy
+// is quarantined it still returns one rather than stalling the run.
 func (p *proxyPool) next() *proxySpec {
 	if p == nil || len(p.items) == 0 {
 		return nil
 	}
-	i := p.idx.Add(1) - 1
-	return p.items[i%uint64(len(p.items))]
+	n := uint64(len(p.items))
+	now := time.Now()
+
+	for tries := 0; tries < len(p.items); tries++ {
+		cand := p.items[(p.idx.Add(1)-1)%n]
+		p.mu.Lock()
+		until, sleeping := p.sleeping[cand.key()]
+		p.mu.Unlock()
+		if !sleeping || now.After(until) {
+			return cand
+		}
+	}
+	// Everything is quarantined: fall back to plain rotation so the run
+	// continues and the cooldowns get a chance to expire.
+	return p.items[(p.idx.Add(1)-1)%n]
+}
+
+// markOK clears the failure streak for a proxy that just worked.
+func (p *proxyPool) markOK(s *proxySpec) {
+	if p == nil || s == nil {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	k := s.key()
+	delete(p.fails, k)
+	delete(p.sleeping, k)
+}
+
+// markFail records a failure and quarantines the proxy once it has failed
+// maxFails times in a row.
+func (p *proxyPool) markFail(s *proxySpec) {
+	if p == nil || s == nil {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	k := s.key()
+	p.fails[k]++
+	if p.fails[k] >= p.maxFails {
+		p.sleeping[k] = time.Now().Add(p.quarantine)
+		p.fails[k] = 0
+	}
+}
+
+// healthy reports how many proxies are not currently quarantined.
+func (p *proxyPool) healthy() int {
+	if p == nil {
+		return 0
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	now := time.Now()
+	n := 0
+	for _, s := range p.items {
+		if until, ok := p.sleeping[s.key()]; !ok || now.After(until) {
+			n++
+		}
+	}
+	return n
 }
 
 // --------------------------------------------------------------- HTTP clients

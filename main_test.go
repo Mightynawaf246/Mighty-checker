@@ -48,7 +48,7 @@ func runOnce(ctx context.Context, usernames []string, pool *proxyPool, cfg *conf
 	sink := newResultSink(cfg)
 	defer sink.close()
 	return runPipeline(ctx, usernames, pool, newClientCache(cfg.timeout), cfg,
-		sink, &liveStats{}, 1, time.Now(), tally{})
+		sink, &liveStats{}, newAdaptiveLimiter(cfg.threads, true), 1, time.Now(), tally{})
 }
 
 func withEndpoint(t *testing.T, url string) {
@@ -143,8 +143,11 @@ func TestPipelineProcessesEveryUsernameExactlyOnce(t *testing.T) {
 	if total != len(usernames) {
 		t.Fatalf("want %d results, got %d", len(usernames), total)
 	}
-	if got := hits.Load(); got != int64(len(usernames)) {
-		t.Errorf("want %d requests, got %d", len(usernames), got)
+	// Every name here comes back available, and an available verdict is
+	// confirmed on a second proxy before it is reported, so each name costs
+	// exactly two requests: one to find it, one to confirm it.
+	if got, want := hits.Load(), int64(2*len(usernames)); got != want {
+		t.Errorf("want %d requests, got %d", want, got)
 	}
 
 	// No duplicates and nothing missing in the output file.
@@ -263,7 +266,8 @@ func TestLoopKeepsResultsAcrossRounds(t *testing.T) {
 	names := []string{"freeuser", "takenuser"}
 	for round := 1; round <= 3; round++ {
 		c := runPipeline(context.Background(), names, newProxyPool(nil),
-			newClientCache(cfg.timeout), cfg, sink, stats, round, start, grand)
+			newClientCache(cfg.timeout), cfg, sink, stats,
+			newAdaptiveLimiter(cfg.threads, true), round, start, grand)
 		grand.add(c)
 	}
 	sink.close()
@@ -276,9 +280,10 @@ func TestLoopKeepsResultsAcrossRounds(t *testing.T) {
 		t.Errorf("want 3 available / 3 taken cumulative, got %d / %d",
 			grand.available, grand.taken)
 	}
-	// Attempts must accumulate across rounds.
-	if got := stats.attempts.Load(); got != 6 {
-		t.Errorf("attempts: want 6, got %d", got)
+	// Attempts must accumulate across rounds. Per round: freeuser costs two
+	// requests (find + confirm), takenuser costs one. Three rounds = nine.
+	if got := stats.attempts.Load(); got != 9 {
+		t.Errorf("attempts: want 9, got %d", got)
 	}
 
 	// But the file holds the name exactly once, with no duplicates.
@@ -510,7 +515,8 @@ func TestLoopRemovesFoundNamesAndNarrows(t *testing.T) {
 		round.Store(int64(r))
 		rounds = r
 		counts := runPipeline(context.Background(), usernames, newProxyPool(nil),
-			newClientCacheFor(cfg.timeout, cfg.threads), cfg, sink, stats, r, start, grand)
+			newClientCacheFor(cfg.timeout, cfg.threads), cfg, sink, stats,
+			newAdaptiveLimiter(cfg.threads, true), r, start, grand)
 		grand.add(counts)
 
 		if len(counts.found) > 0 {
@@ -563,5 +569,179 @@ func TestLoopRemovesFoundNamesAndNarrows(t *testing.T) {
 		if !strings.Contains(string(got), want) {
 			t.Errorf("available.txt missing %s: %q", want, string(got))
 		}
+	}
+}
+
+// ---------------------------------------------------------- accuracy guarantees
+
+// scriptedEndpoint replies with a caller-supplied sequence of bodies, so a test
+// can make the same username answer differently on each attempt. Once the
+// script runs out the last entry repeats.
+func scriptedEndpoint(t *testing.T, hits *atomic.Int64, bodies ...string) *httptest.Server {
+	t.Helper()
+	var n atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if hits != nil {
+			hits.Add(1)
+		}
+		i := int(n.Add(1)) - 1
+		if i >= len(bodies) {
+			i = len(bodies) - 1
+		}
+		body := bodies[i]
+		if strings.HasPrefix(body, "HTTP:") {
+			code := 0
+			fmt.Sscanf(body, "HTTP:%d", &code)
+			w.WriteHeader(code)
+			return
+		}
+		fmt.Fprint(w, body)
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+const (
+	bodyAvailable = `{"data":{"xfb_caa_registration_field_validation":{"status":"SUCCESS"}}}`
+	bodyTaken     = `{"data":{"xfb_caa_registration_field_validation":{"status":"VALIDATION_ERROR"}}}`
+	bodyGarbage   = `<html>edge blocked</html>`
+)
+
+// A false "available" is the costliest mistake this tool can make, so a first
+// available answer is re-checked. If the re-check says taken, taken wins.
+func TestAvailableIsConfirmedAndDisagreementLosesToTaken(t *testing.T) {
+	var hits atomic.Int64
+	srv := scriptedEndpoint(t, &hits, bodyAvailable, bodyTaken)
+	withEndpoint(t, srv.URL)
+
+	cfg := &config{threads: 1, timeout: 5 * time.Second, retries: 1,
+		outDir: t.TempDir(), quiet: true}
+	counts := runOnce(context.Background(), []string{"someuser"}, newProxyPool(nil), cfg)
+
+	if counts.available != 0 || counts.taken != 1 {
+		t.Errorf("want the name reported taken, got %+v", counts)
+	}
+	if got := hits.Load(); got != 2 {
+		t.Errorf("want exactly 2 requests (check + confirm), got %d", got)
+	}
+}
+
+// Two agreeing available answers are what it takes to report a name free.
+func TestConfirmedAvailableIsReported(t *testing.T) {
+	var hits atomic.Int64
+	srv := scriptedEndpoint(t, &hits, bodyAvailable, bodyAvailable)
+	withEndpoint(t, srv.URL)
+
+	cfg := &config{threads: 1, timeout: 5 * time.Second, retries: 1,
+		outDir: t.TempDir(), quiet: true}
+	counts := runOnce(context.Background(), []string{"someuser"}, newProxyPool(nil), cfg)
+
+	if counts.available != 1 {
+		t.Errorf("want 1 available, got %+v", counts)
+	}
+	if len(counts.found) != 1 || counts.found[0] != "someuser" {
+		t.Errorf("found list: %v", counts.found)
+	}
+	if got := hits.Load(); got != 2 {
+		t.Errorf("want exactly 2 requests, got %d", got)
+	}
+}
+
+// An available answer that cannot be confirmed is reported as unknown, never as
+// available: the tool guesses in the safe direction.
+func TestUnconfirmableAvailableBecomesUnknown(t *testing.T) {
+	srv := scriptedEndpoint(t, nil, bodyAvailable, bodyGarbage)
+	withEndpoint(t, srv.URL)
+
+	cfg := &config{threads: 1, timeout: 5 * time.Second, retries: 1,
+		outDir: t.TempDir(), quiet: true}
+	counts := runOnce(context.Background(), []string{"someuser"}, newProxyPool(nil), cfg)
+
+	if counts.available != 0 || counts.unknown != 1 {
+		t.Errorf("want the name reported unknown, got %+v", counts)
+	}
+	if len(counts.found) != 0 {
+		t.Errorf("an unconfirmed name must not be moved to available.txt: %v", counts.found)
+	}
+}
+
+// -no-confirm trades that guarantee for one request per name.
+func TestNoConfirmSkipsTheSecondCheck(t *testing.T) {
+	var hits atomic.Int64
+	srv := scriptedEndpoint(t, &hits, bodyAvailable, bodyTaken)
+	withEndpoint(t, srv.URL)
+
+	cfg := &config{threads: 1, timeout: 5 * time.Second, retries: 1,
+		outDir: t.TempDir(), quiet: true, noConfirm: true}
+	counts := runOnce(context.Background(), []string{"someuser"}, newProxyPool(nil), cfg)
+
+	if counts.available != 1 {
+		t.Errorf("want 1 available, got %+v", counts)
+	}
+	if got := hits.Load(); got != 1 {
+		t.Errorf("want exactly 1 request, got %d", got)
+	}
+}
+
+// An inconclusive answer is retried on another proxy rather than accepted, so a
+// name that answers garbage once and cleanly the second time resolves cleanly.
+func TestInconclusiveAnswerIsRetried(t *testing.T) {
+	var hits atomic.Int64
+	srv := scriptedEndpoint(t, &hits, bodyGarbage, bodyTaken)
+	withEndpoint(t, srv.URL)
+
+	cfg := &config{threads: 1, timeout: 5 * time.Second, retries: 1,
+		outDir: t.TempDir(), quiet: true}
+	counts := runOnce(context.Background(), []string{"someuser"}, newProxyPool(nil), cfg)
+
+	if counts.taken != 1 {
+		t.Errorf("want the retry to resolve the name as taken, got %+v", counts)
+	}
+	if got := hits.Load(); got != 2 {
+		t.Errorf("want 2 requests (first inconclusive, second definite), got %d", got)
+	}
+}
+
+// A high thread count with adaptation on must still finish, and must still
+// answer every name exactly once. This is the deadlock guard: the limiter, the
+// worker pool and the writer all have to shut down cleanly together.
+func TestHighThreadCountUnderThrottlingCompletes(t *testing.T) {
+	var hits atomic.Int64
+	// Throttle one request in three, so the limiter is actively cutting and
+	// growing the cap for the whole run.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := hits.Add(1)
+		if n%3 == 0 {
+			w.Header().Set("Retry-After", "0")
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		fmt.Fprint(w, bodyTaken)
+	}))
+	t.Cleanup(srv.Close)
+	withEndpoint(t, srv.URL)
+
+	dir := t.TempDir()
+	cfg := &config{threads: 300, timeout: 5 * time.Second, retries: 2,
+		outDir: dir, quiet: true}
+
+	var usernames []string
+	for i := 0; i < 400; i++ {
+		usernames = append(usernames, fmt.Sprintf("name%d", i))
+	}
+
+	done := make(chan tally, 1)
+	go func() { done <- runOnce(context.Background(), usernames, newProxyPool(nil), cfg) }()
+
+	select {
+	case counts := <-done:
+		if counts.total() != len(usernames) {
+			t.Errorf("want %d results, got %d (%+v)", len(usernames), counts.total(), counts)
+		}
+		if counts.available != 0 {
+			t.Errorf("nothing here is available, got %d", counts.available)
+		}
+	case <-time.After(60 * time.Second):
+		t.Fatal("the run deadlocked at 300 threads")
 	}
 }
