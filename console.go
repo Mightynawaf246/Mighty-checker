@@ -116,20 +116,23 @@ func decideColor(cfg *config) bool {
 
 // statusView is everything shown in the live status line.
 type statusView struct {
-	Round    int           // current loop round (1 when looping is off)
 	Loop     bool          // is loop mode enabled?
+	Passes   int           // complete cycles of the list finished so far
 	RPS      int           // requests per second (including retries)
 	UPS      int           // usernames checked per second
 	Attempts int64         // total requests sent
 	Checked  int           // total usernames finished
-	Total    int           // list size for the current round
+	Left     int           // names still being watched
 	Counts   tally         // cumulative counters
 	Elapsed  time.Duration // time since start
 
-	// Cus is the current concurrency in use: the adaptive cap the run has
-	// settled on, which is at most -threads and drops when the endpoint pushes
-	// back. Zero means adaptation is off and every thread runs flat out.
-	Cus int
+	// Cus is the concurrency actually in use, and Threads is what was asked
+	// for. They are shown together whenever they differ, because "why is my
+	// rate low" is almost always explained by the gap between them - and most
+	// often by the list being smaller than the thread count, which no amount
+	// of -t can change.
+	Cus     int
+	Threads int
 
 	ProxiesOK  int // proxies not currently quarantined
 	ProxiesAll int // proxies loaded
@@ -143,18 +146,15 @@ func buildStatus(name string, v statusView) string {
 	sep := cGray(" │ ")
 
 	head := label(name)
-	if v.Loop {
-		head += " " + cPurple(fmt.Sprintf("R%d", v.Round))
-	}
 
-	// Progress within the round, with a percentage when the size is known.
+	// Progress. In a single pass this is "done out of the list"; while looping
+	// there is no end to count towards, so it is just how many checks have
+	// completed. The old round counter is gone: the run no longer stops and
+	// restarts, so there is no round to number.
 	progress := fmt.Sprintf("%d", v.Checked)
-	if v.Total > 0 {
-		pct := 0
-		if v.Total > 0 {
-			pct = v.Checked * 100 / v.Total
-		}
-		progress = fmt.Sprintf("%d/%d %d%%", v.Checked, v.Total, pct)
+	if !v.Loop && v.Checked+v.Left > 0 {
+		total := v.Checked + v.Left
+		progress = fmt.Sprintf("%d/%d %d%%", v.Checked, total, v.Checked*100/total)
 	}
 
 	line := head + " " +
@@ -166,7 +166,12 @@ func buildStatus(name string, v statusView) string {
 	// CUS = concurrency in use, the live adaptive cap. Shown only when
 	// adaptation is on, since a fixed cap tells the user nothing.
 	if v.Cus > 0 {
-		line += seg("CUS", fmt.Sprintf("%d", v.Cus)) + sep
+		cus := fmt.Sprintf("%d", v.Cus)
+		if v.Threads > v.Cus {
+			// Say what it is out of, so a capped run is obvious at a glance.
+			cus = fmt.Sprintf("%d/%d", v.Cus, v.Threads)
+		}
+		line += seg("CUS", cus) + sep
 	}
 	// Proxy health, shown only when proxies are in play.
 	if v.ProxiesAll > 0 {
@@ -175,6 +180,14 @@ func buildStatus(name string, v statusView) string {
 			line += cGray("PX ") + cCyan(px) + sep
 		} else {
 			line += cGray("PX ") + cYellow(px) + sep
+		}
+	}
+
+	if v.Loop {
+		// What is left to watch, and how many complete sweeps have finished.
+		line += seg("Left", fmt.Sprintf("%d", v.Left)) + sep
+		if v.Passes > 0 {
+			line += cGray("x") + cPurple(fmt.Sprintf("%d", v.Passes)) + sep
 		}
 	}
 

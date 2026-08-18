@@ -512,9 +512,8 @@ func TestThrottlingDoesNotEmptyTheProxyPool(t *testing.T) {
 		names = append(names, fmt.Sprintf("name%d", i))
 	}
 	sink := newResultSink(cfg)
-	runPipeline(context.Background(), names, pool,
-		newClientCacheFor(cfg.timeout, cfg.threads), cfg, sink, &liveStats{},
-		newAdaptiveLimiter(cfg.threads, true), 1, time.Now(), tally{})
+	runPipeline(context.Background(), newWorklist(names, cfg.loop), pool,
+		newClientCacheFor(cfg.timeout, cfg.threads), cfg, sink, &liveStats{}, newAdaptiveLimiter(cfg.threads, true), time.Now())
 	sink.close()
 
 	// Nothing to quarantine with a direct connection, but the accounting must

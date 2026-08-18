@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -65,8 +66,8 @@ func usernameFromPayload(body string) string {
 func runOnce(ctx context.Context, usernames []string, pool *proxyPool, cfg *config) tally {
 	sink := newResultSink(cfg)
 	defer sink.close()
-	return runPipeline(ctx, usernames, pool, newClientCache(cfg.timeout), cfg,
-		sink, &liveStats{}, newAdaptiveLimiter(cfg.threads, true), 1, time.Now(), tally{})
+	return runPipeline(ctx, newWorklist(usernames, cfg.loop), pool, newClientCache(cfg.timeout), cfg,
+		sink, &liveStats{}, newAdaptiveLimiter(cfg.threads, true), time.Now())
 }
 
 func withEndpoint(t *testing.T, url string) {
@@ -270,52 +271,185 @@ func TestPipelineWithNoUsernames(t *testing.T) {
 	}
 }
 
-// In loop mode the result files stay open across rounds, so the previous
-// round's results are not wiped and a name is never repeated in the file.
-func TestLoopKeepsResultsAcrossRounds(t *testing.T) {
-	srv := fakeInstagram(t, nil)
+// Looping must be one continuous run, not a series of restarts. A name is
+// re-checked over and over, but it appears in the file exactly once and nothing
+// is torn down in between.
+func TestLoopIsContinuousAndDoesNotRepeatFileLines(t *testing.T) {
+	var hits atomic.Int64
+	srv := fakeInstagram(t, &hits)
 	withEndpoint(t, srv.URL)
 
 	dir := t.TempDir()
-	cfg := &config{threads: 2, timeout: 5 * time.Second, retries: 1,
-		outDir: dir, quiet: true, loop: true}
+	listPath := filepath.Join(dir, "username.txt")
+	if err := os.WriteFile(listPath, []byte("takenuser\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config{threads: 4, timeout: 5 * time.Second, retries: 1,
+		outDir: dir, quiet: true, loop: true, usernamesFile: listPath}
 
 	sink := newResultSink(cfg)
 	stats := &liveStats{}
-	start := time.Now()
+	wl := newWorklist([]string{"takenuser"}, true)
 
-	var grand tally
-	names := []string{"freeuser", "takenuser"}
-	for round := 1; round <= 3; round++ {
-		c := runPipeline(context.Background(), names, newProxyPool(nil),
-			newClientCache(cfg.timeout), cfg, sink, stats,
-			newAdaptiveLimiter(cfg.threads, true), round, start, grand)
-		grand.add(c)
+	// Let it cycle for a while, then stop it the way Ctrl-C would.
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		for stats.attempts.Load() < 50 {
+			time.Sleep(time.Millisecond)
+		}
+		cancel()
+	}()
+
+	counts := runPipeline(ctx, wl, newProxyPool(nil), newClientCache(cfg.timeout),
+		cfg, sink, stats, newAdaptiveLimiter(cfg.threads, true), time.Now())
+	sink.close()
+	cancel()
+
+	// It kept going round rather than stopping after one pass.
+	if counts.taken < 40 {
+		t.Errorf("want the name checked many times, got %d", counts.taken)
+	}
+	if got := wl.passCount(); got < 10 {
+		t.Errorf("want many completed cycles, got %d", got)
+	}
+
+	// And the file still holds it exactly once.
+	data, err := os.ReadFile(filepath.Join(dir, "taken.txt"))
+	if err != nil {
+		t.Fatalf("read taken.txt: %v", err)
+	}
+	if lines := strings.Fields(strings.TrimSpace(string(data))); len(lines) != 1 {
+		t.Errorf("taken.txt should hold one line, got %q", string(data))
+	}
+}
+
+// A name in flight must never be handed to a second worker: checking @foo in
+// five places at once returns the same answer five times and spends five times
+// the rate limit to get it.
+func TestWorklistNeverDuplicatesAName(t *testing.T) {
+	wl := newWorklist([]string{"a", "b", "c"}, true)
+
+	var mu sync.Mutex
+	live := map[string]bool{}
+	var clash atomic.Bool
+
+	var wg sync.WaitGroup
+	ctx, cancel := context.WithCancel(context.Background())
+	for i := 0; i < 32; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				name, ok := wl.claim(ctx)
+				if !ok {
+					return
+				}
+				mu.Lock()
+				if live[name] {
+					clash.Store(true)
+				}
+				live[name] = true
+				mu.Unlock()
+
+				time.Sleep(time.Millisecond)
+
+				mu.Lock()
+				delete(live, name)
+				mu.Unlock()
+				wl.release(name)
+			}
+		}()
+	}
+	time.Sleep(150 * time.Millisecond)
+	cancel()
+	wl.close()
+	wg.Wait()
+
+	if clash.Load() {
+		t.Error("the same name was checked by two workers at once")
+	}
+	if wl.passCount() == 0 {
+		t.Error("the list never cycled")
+	}
+}
+
+// The whole point of loop mode: keep checking the names still taken until they
+// free up, moving each one out as it does, and finish when none are left. It
+// must do that in a single uninterrupted run.
+func TestWatchesNamesUntilTheyFreeUp(t *testing.T) {
+	var seen atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		name := usernameFromPayload(string(body))
+		n := seen.Add(1)
+
+		switch {
+		case strings.HasPrefix(name, "freeuser"):
+			fmt.Fprint(w, bodyAvailable)
+		case n > 30:
+			// takenuser frees up part way through the run.
+			fmt.Fprint(w, bodyAvailable)
+		default:
+			fmt.Fprint(w, bodyTaken)
+		}
+	}))
+	defer srv.Close()
+	withEndpoint(t, srv.URL)
+
+	dir := t.TempDir()
+	listPath := filepath.Join(dir, "username.txt")
+	if err := os.WriteFile(listPath,
+		[]byte("# watch list\nfreeuser\ntakenuser\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &config{threads: 8, timeout: 5 * time.Second, retries: 1,
+		outDir: dir, quiet: true, loop: true, usernamesFile: listPath}
+
+	sink := newResultSink(cfg)
+	names, _ := loadLines(listPath)
+	wl := newWorklist(names, true)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	done := make(chan tally, 1)
+	go func() {
+		done <- runPipeline(ctx, wl, newProxyPool(nil),
+			newClientCacheFor(cfg.timeout, cfg.threads), cfg, sink,
+			&liveStats{}, newAdaptiveLimiter(cfg.threads, true), time.Now())
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the run never finished after both names freed up")
 	}
 	sink.close()
 
-	// Three rounds x two names = six cumulative results.
-	if grand.total() != 6 {
-		t.Errorf("cumulative total: want 6, got %d (%+v)", grand.total(), grand)
+	// The list is empty of usernames but keeps its comment.
+	left, _ := loadLines(listPath)
+	if len(left) != 0 {
+		t.Errorf("list should be empty, still holds %v", left)
 	}
-	if grand.available != 3 || grand.taken != 3 {
-		t.Errorf("want 3 available / 3 taken cumulative, got %d / %d",
-			grand.available, grand.taken)
-	}
-	// Attempts must accumulate across rounds. Per round: freeuser costs two
-	// requests (find + confirm), takenuser costs one. Three rounds = nine.
-	if got := stats.attempts.Load(); got != 9 {
-		t.Errorf("attempts: want 9, got %d", got)
+	raw, _ := os.ReadFile(listPath)
+	if !strings.Contains(string(raw), "# watch list") {
+		t.Errorf("comment lost from the list: %q", string(raw))
 	}
 
-	// But the file holds the name exactly once, with no duplicates.
-	data, err := os.ReadFile(filepath.Join(dir, "available.txt"))
+	// Both names ended up in available.txt, each exactly once.
+	got, err := os.ReadFile(filepath.Join(dir, "available.txt"))
 	if err != nil {
 		t.Fatalf("read available.txt: %v", err)
 	}
-	lines := strings.Fields(strings.TrimSpace(string(data)))
-	if len(lines) != 1 || lines[0] != "freeuser" {
-		t.Errorf("available.txt should hold freeuser exactly once, got %q", string(data))
+	lines := strings.Fields(strings.TrimSpace(string(got)))
+	if len(lines) != 2 {
+		t.Fatalf("available.txt should hold 2 names exactly once each, got %q", string(got))
+	}
+	for _, want := range []string{"freeuser", "takenuser"} {
+		if !strings.Contains(string(got), want) {
+			t.Errorf("available.txt missing %s: %q", want, string(got))
+		}
 	}
 }
 
@@ -487,110 +621,6 @@ func TestTallyReportsFoundNames(t *testing.T) {
 
 	if len(counts.found) != 1 || counts.found[0] != "freeuser" {
 		t.Fatalf("found: want [freeuser], got %v", counts.found)
-	}
-}
-
-// Full loop behavior: an available name is written to available.txt AND removed
-// from the usernames file, the next round only re-checks what is still taken,
-// and the loop ends once the list is empty. This is the watch-until-free flow.
-func TestLoopRemovesFoundNamesAndNarrows(t *testing.T) {
-	// takenuser starts taken and frees up on round 3.
-	var round atomic.Int64
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body, _ := io.ReadAll(r.Body)
-		s := string(body)
-		switch {
-		case strings.Contains(s, `"sensitive_string_value":"freeuser"`):
-			fmt.Fprint(w, `{"data":{"x":{"status":"SUCCESS"}}}`)
-		case strings.Contains(s, `"sensitive_string_value":"takenuser"`):
-			if round.Load() >= 3 {
-				fmt.Fprint(w, `{"data":{"x":{"status":"SUCCESS"}}}`)
-			} else {
-				fmt.Fprint(w, `{"data":{"x":{"status":"VALIDATION_ERROR"}}}`)
-			}
-		default:
-			fmt.Fprint(w, `{"data":{"x":{"status":"VALIDATION_ERROR"}}}`)
-		}
-	}))
-	defer srv.Close()
-	withEndpoint(t, srv.URL)
-
-	dir := t.TempDir()
-	listPath := filepath.Join(dir, "username.txt")
-	if err := os.WriteFile(listPath,
-		[]byte("# watch list\nfreeuser\ntakenuser\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	cfg := &config{threads: 50, timeout: 5 * time.Second, retries: 1,
-		outDir: dir, quiet: true, loop: true, usernamesFile: listPath}
-
-	sink := newResultSink(cfg)
-	stats := &liveStats{}
-	start := time.Now()
-
-	usernames, _ := loadLines(listPath)
-	var grand tally
-	rounds := 0
-
-	for r := 1; r <= 10; r++ {
-		round.Store(int64(r))
-		rounds = r
-		counts := runPipeline(context.Background(), usernames, newProxyPool(nil),
-			newClientCacheFor(cfg.timeout, cfg.threads), cfg, sink, stats,
-			newAdaptiveLimiter(cfg.threads, true), r, start, grand)
-		grand.add(counts)
-
-		if len(counts.found) > 0 {
-			left, err := removeFromList(listPath, counts.found)
-			if err != nil {
-				t.Fatalf("removeFromList: %v", err)
-			}
-			if left == 0 {
-				break
-			}
-		}
-		reloaded, _ := loadLines(listPath)
-		if len(reloaded) == 0 {
-			break
-		}
-		usernames = reloaded
-
-		// Round 1 frees freeuser only, so the list must narrow to one name.
-		if r == 1 && len(usernames) != 1 {
-			t.Fatalf("after round 1 the list should hold 1 name, got %v", usernames)
-		}
-	}
-	sink.close()
-
-	// takenuser frees on round 3, so the loop should end at round 3.
-	if rounds != 3 {
-		t.Errorf("loop should end on round 3, ended on %d", rounds)
-	}
-
-	// The list is empty of usernames but keeps its comment.
-	left, _ := loadLines(listPath)
-	if len(left) != 0 {
-		t.Errorf("list should be empty, still holds %v", left)
-	}
-	raw, _ := os.ReadFile(listPath)
-	if !strings.Contains(string(raw), "# watch list") {
-		t.Errorf("comment lost from the list: %q", string(raw))
-	}
-
-	// Both names ended up in available.txt, each exactly once.
-	got, err := os.ReadFile(filepath.Join(dir, "available.txt"))
-	if err != nil {
-		t.Fatalf("read available.txt: %v", err)
-	}
-	lines := strings.Fields(strings.TrimSpace(string(got)))
-	if len(lines) != 2 {
-		t.Fatalf("available.txt should hold 2 names exactly once each, got %q", string(got))
-	}
-	for _, want := range []string{"freeuser", "takenuser"} {
-		if !strings.Contains(string(got), want) {
-			t.Errorf("available.txt missing %s: %q", want, string(got))
-		}
 	}
 }
 
@@ -788,9 +818,8 @@ func TestUnknownAnswersDoNotCutConcurrency(t *testing.T) {
 	}
 
 	sink := newResultSink(cfg)
-	counts := runPipeline(context.Background(), usernames, newProxyPool(nil),
-		newClientCacheFor(cfg.timeout, cfg.threads), cfg, sink, &liveStats{},
-		lim, 1, time.Now(), tally{})
+	counts := runPipeline(context.Background(), newWorklist(usernames, cfg.loop), newProxyPool(nil),
+		newClientCacheFor(cfg.timeout, cfg.threads), cfg, sink, &liveStats{}, lim, time.Now())
 	sink.close()
 
 	if counts.unknown != len(usernames) {
@@ -820,9 +849,8 @@ func TestThrottleResponsesCutConcurrency(t *testing.T) {
 	}
 
 	sink := newResultSink(cfg)
-	runPipeline(context.Background(), usernames, newProxyPool(nil),
-		newClientCacheFor(cfg.timeout, cfg.threads), cfg, sink, &liveStats{},
-		lim, 1, time.Now(), tally{})
+	runPipeline(context.Background(), newWorklist(usernames, cfg.loop), newProxyPool(nil),
+		newClientCacheFor(cfg.timeout, cfg.threads), cfg, sink, &liveStats{}, lim, time.Now())
 	sink.close()
 
 	if got := lim.current(); got >= cfg.threads {
@@ -875,9 +903,8 @@ func TestNoAdaptKeepsFullConcurrencyUnderThrottling(t *testing.T) {
 	}
 
 	sink := newResultSink(cfg)
-	counts := runPipeline(context.Background(), usernames, newProxyPool(nil),
-		newClientCacheFor(cfg.timeout, cfg.threads), cfg, sink, &liveStats{},
-		lim, 1, time.Now(), tally{})
+	counts := runPipeline(context.Background(), newWorklist(usernames, cfg.loop), newProxyPool(nil),
+		newClientCacheFor(cfg.timeout, cfg.threads), cfg, sink, &liveStats{}, lim, time.Now())
 	sink.close()
 
 	if counts.total() != len(usernames) {

@@ -84,6 +84,23 @@ Passing any flag (for example `-t 50`) skips the menu and starts immediately,
 so scripting still works. `-no-prompt` disables the menu entirely, and `-menu`
 forces it even when flags are present.
 
+## Continuous checking (no rounds)
+
+A run is one uninterrupted stream. Workers take the next free name, check it,
+and go straight to the next; in loop mode the list simply wraps around. Nothing
+is ever torn down and rebuilt.
+
+Earlier versions worked in rounds — one pass over the list, tear everything
+down, rebuild, start again — which the status line showed as `R1`, `R2`, `R3`.
+That stuttered in three ways: throughput fell to zero at every boundary while
+the pipeline drained, the connection pools went idle, and the rate meters were
+rebuilt from scratch each time. That last one is why a short list appeared to be
+pinned to a low fixed rate: a one-second pass over twenty-four names could only
+ever display about 24/sec, no matter how fast the machine really was.
+
+The list is also re-read every few seconds, so you can edit `username.txt` while
+the tool is running and it picks the changes up without pausing.
+
 ## Loop mode: watch names until they free up
 
 ```bash
@@ -213,17 +230,18 @@ sends one, with exponential backoff otherwise.
 ## Status line
 
 ```
-[ Mighty ] R2 | RPS 2133 | UPS 1876 | Att 219719 | Chk 4210/5000 84% | CUS 380 | PX 47/50 | A 3 | T 900 | U 5 | E 2 | 1m43s
+[ Mighty ] RPS 21823 | UPS 21804 | Att 219719 | Chk 4210 | CUS 380/500 | PX 47/50 | Left 4972 | x12 | A 3 | T 900 | U 5 | E 2 | 1m43s
 ```
 
 | Field | Meaning |
 |-------|---------|
-| `R2` | round number (in loop mode) |
 | `RPS` | requests per second (including retries) |
 | `UPS` | usernames checked per second |
 | `Att` | total requests sent |
 | `Chk` | checked out of the round total, with percentage |
-| `CUS` | concurrency in use — the adaptive cap, or the worker count if lower |
+| `CUS` | concurrency in use, shown as `used/asked` when they differ |
+| `Left` | names still being watched (loop mode) |
+| `xN` | complete sweeps of the list finished so far (loop mode) |
 | `PX` | healthy proxies out of the total (hidden without proxies) |
 | `A / T / U / E` | available / taken / unknown / errors |
 
@@ -250,12 +268,36 @@ every thread was busy and latency is the wall.
 `UPS` is `concurrency / latency`, so there are exactly two levers, and `CUS`
 tells you which one you are short of.
 
-**1. More concurrency.** Raise `-t`, and turn off the automatic slowdown with
-`-no-adapt` (or the menu question) so the number you set is the number you get.
-This only helps while `CUS` is actually reaching your `-t`.
+**1. More names.** This is the one people miss. A name cannot be checked in two
+places at once — the second answer is the same as the first — so **the number of
+names in your list is a hard ceiling on concurrency**. Twenty-four names means
+twenty-four workers, whatever `-t` says, and the config panel tells you when this
+is happening:
 
-**2. Less latency.** This is usually the real limit, and it is mostly your proxy
-list. Two settings matter here:
+```
+  Threads  : 500
+  Workers  : 24 - capped by the 24 names in the list, not by -t 500
+```
+
+Measured with 500 threads against a 20ms endpoint, changing nothing but the list:
+
+| names in the list | requests/sec |
+|-------------------|--------------|
+| 24 | 1 098 |
+| 500 | 21 823 |
+| 5 000 | 21 518 |
+
+The arithmetic is `names in flight ÷ latency`. To sustain 5 000/sec through
+proxies that answer in 300ms you need about 1 500 names in flight, so the list
+has to hold at least that many.
+
+**2. More concurrency.** Raise `-t`, and turn off the automatic slowdown with
+`-no-adapt` (or the menu question) so the number you set is the number you get.
+This only helps once the list is bigger than your thread count.
+
+**3. Less latency.** Once the list is large enough and every thread is busy,
+this is the only lever left, and it is mostly your proxy list. Two settings
+matter here:
 
 - **`-timeout`** — the default is `10s`, which means a hung proxy occupies a
   worker for ten full seconds before it is given up on. On a decent list

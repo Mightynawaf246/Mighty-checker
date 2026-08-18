@@ -230,10 +230,6 @@ func (s *resultSink) close() {
 
 const appName = "Mighty"
 
-// minRoundPause is the shortest gap between two loop rounds. It exists purely
-// to stop a round that does no network work from spinning the CPU.
-const minRoundPause = 500 * time.Millisecond
-
 func main() {
 	cfg := parseFlags()
 
@@ -329,99 +325,33 @@ func main() {
 	cache := newClientCacheFor(cfg.timeout, cfg.threads).withHTTP2(cfg.http2)
 	defer cache.closeIdle()
 
-	// One limiter for the whole run, shared across rounds, so what a round
-	// learned about the endpoint's tolerance is not thrown away at the boundary.
+	// One limiter for the whole run, so what it learns about the endpoint's
+	// tolerance is never thrown away.
 	lim := newAdaptiveLimiter(cfg.threads, !cfg.noAdapt)
 
-	// Result files are opened once and stay open across every loop round.
 	sink := newResultSink(cfg)
 	defer sink.close()
 
-	stats := &liveStats{}
-	var grand tally
-	start := time.Now()
-	rounds := 0
-	cleared := false
+	// The live list every worker pulls from. In loop mode it wraps around
+	// forever; otherwise it is exhausted once and the run ends.
+	wl := newWorklist(usernames, cfg.loop)
 
-	for round := 1; ; round++ {
-		rounds = round
-		counts := runPipeline(ctx, usernames, pool, cache, cfg, sink, stats, lim,
-			round, start, grand)
-		grand.add(counts)
-		sink.flush()
-
-		// A name that came back available is done: it is already recorded in
-		// available.txt, so drop it from the working list and stop re-checking
-		// it. The loop then narrows to the names still taken.
-		//
-		// Never prune the list while the results file is failing. Deleting a
-		// name from the input on the strength of a write that did not land
-		// destroys the only two records of it at once.
-		switch {
-		case sink.err != nil:
-			warnf("results are not being written (%v) - leaving %s untouched",
-				sink.err, cfg.usernamesFile)
-		case !cfg.keepList && len(counts.found) > 0:
-			left, err := removeFromList(cfg.usernamesFile, counts.found)
-			if err != nil {
-				warnf("cannot update %s: %v", cfg.usernamesFile, err)
-			} else {
-				fmt.Printf("%s %s\n",
-					cGreen(fmt.Sprintf("[+] moved %d name(s) to available.txt", len(counts.found))),
-					cGray(fmt.Sprintf("- %d left in %s", left, cfg.usernamesFile)))
-				if left == 0 {
-					cleared = true
-				}
-			}
-		}
-
-		if !cfg.loop || ctx.Err() != nil {
-			break
-		}
-		if cleared {
-			fmt.Println("  " + cGreen("every name in the list is available - nothing left to watch."))
-			break
-		}
-		// A round in which nothing was actually checked will never become one
-		// that does. Spinning on it pins a core and rewrites the terminal
-		// forever with no network work at all.
-		if counts.total() > 0 && counts.invalid == counts.total() {
-			fmt.Println("  " + cYellow("no valid usernames in the list - nothing to watch."))
-			break
-		}
-
-		// Pace the rounds. A round can complete in microseconds — every proxy
-		// refusing the connection returns instantly — and with no pause the
-		// loop then burns 100% of a core re-reading the list tens of thousands
-		// of times a second.
-		pause := cfg.delay
-		if pause < minRoundPause {
-			pause = minRoundPause
-		}
-		select {
-		case <-time.After(pause):
-		case <-ctx.Done():
-		}
-		if ctx.Err() != nil {
-			break
-		}
-
-		// Re-read the list each round, so the file can be edited while running.
-		reloaded, err := loadLines(cfg.usernamesFile)
-		if err != nil {
-			// Silently carrying on with a stale in-memory list hides a deleted
-			// or unreadable file for the rest of the run.
-			warnf("cannot re-read %s (%v) - continuing with the list already loaded", cfg.usernamesFile, err)
-		} else if len(reloaded) == 0 {
-			fmt.Println("  " + cGreen("the list is empty - nothing left to watch."))
-			break
-		} else {
-			usernames = reloaded
-		}
+	// While looping, pick up edits to the usernames file without interrupting
+	// anything. The file is the user's to change mid-run, and re-reading it used
+	// to be possible only at a round boundary.
+	if cfg.loop {
+		go watchList(ctx, cfg, wl)
 	}
 
+	stats := &liveStats{}
+	start := time.Now()
+
+	counts := runPipeline(ctx, wl, pool, cache, cfg, sink, stats, lim, start)
+	sink.flush()
+
 	elapsed := time.Since(start)
-	printSummary(cfg, grand, elapsed, ctx.Err() != nil, rounds, lim, pool, stats.attempts.Load())
+	printSummary(cfg, counts, elapsed, ctx.Err() != nil, wl.passCount(), lim, pool,
+		stats.attempts.Load(), len(usernames))
 }
 
 // printSpeedDiagnosis names the actual bottleneck of the run just finished.
@@ -430,11 +360,17 @@ func main() {
 // rate has exactly three possible causes, and the tool knows which one applied.
 // Saying so beats leaving the user to guess between buying proxies, raising
 // -t, and assuming the tool is broken.
-func printSpeedDiagnosis(cfg *config, counts tally, lim *adaptiveLimiter, pool *proxyPool) {
+func printSpeedDiagnosis(cfg *config, counts tally, lim *adaptiveLimiter,
+	pool *proxyPool, listSize int) {
 	cap := effectiveConcurrency(lim, cfg.threads)
 	var lines []string
 
 	switch {
+	case listSize > 0 && listSize < cfg.threads:
+		lines = append(lines, fmt.Sprintf(
+			"the list held %d names, so only %d workers ran however high -t was set. "+
+				"A name cannot be checked twice at once; to go faster you need more "+
+				"names, not more threads.", listSize, listSize))
 	case cfg.noAdapt:
 		// The user asked for full throttle; nothing to say about the cap.
 	case cap < cfg.threads/2:
@@ -544,6 +480,15 @@ func printConfig(cfg *config, usernames []string, pool *proxyPool) {
 	fmt.Println(" " + label(appName+" Checker") + " " + cGray("v"+appVersion()))
 	row("Target", cWhite(fmt.Sprintf("%s (%d names)", cfg.usernamesFile, len(usernames))))
 	row("Threads", cCyan(fmt.Sprintf("%d", cfg.threads)))
+
+	// A thread with no name to check is not a thread. Starting 500 workers on a
+	// 24-name list gives 24 workers, and no setting changes that: the same name
+	// cannot be checked twice at once. Saying so here saves the user hunting for
+	// a throttle that is not happening.
+	if n := len(usernames); n > 0 && n < cfg.threads {
+		row("Workers", cYellow(fmt.Sprintf("%d - capped by the %d names in the list, not by -t %d",
+			n, n, cfg.threads)))
+	}
 	row("Proxies", proxies)
 	row("Timeout", cCyan(cfg.timeout.String()))
 	row("Retries", cCyan(fmt.Sprintf("%d", cfg.retries)))
@@ -578,7 +523,7 @@ func printConfig(cfg *config, usernames []string, pool *proxyPool) {
 
 // printSummary prints the final summary panel.
 func printSummary(cfg *config, counts tally, elapsed time.Duration, interrupted bool,
-	rounds int, lim *adaptiveLimiter, pool *proxyPool, attempts int64) {
+	rounds int, lim *adaptiveLimiter, pool *proxyPool, attempts int64, listSize int) {
 	fmt.Println()
 	if interrupted {
 		fmt.Println(" " + cYellow("[ interrupted — partial results were flushed ]"))
@@ -595,6 +540,10 @@ func printSummary(cfg *config, counts tally, elapsed time.Duration, interrupted 
 	row("Errors", cRed(fmt.Sprintf("%d", counts.errored)))
 	if rounds > 1 {
 		row("Rounds", cPurple(fmt.Sprintf("%d", rounds)))
+		// For a watch list, how fast one pass completes is the number that
+		// matters - it is how quickly a freed name gets noticed. Raw
+		// requests-per-second says nothing useful about a 24-name list.
+		row("Per round", cCyan((elapsed / time.Duration(rounds)).Round(time.Millisecond).String()))
 	}
 	row("Elapsed", cCyan(elapsed.Round(time.Millisecond).String()))
 
@@ -608,15 +557,21 @@ func printSummary(cfg *config, counts tally, elapsed time.Duration, interrupted 
 
 		// Average latency per check, derived rather than measured: with N
 		// concurrent checks running for T seconds and A attempts finished,
-		// each attempt took about N*T/A.
-		cap := effectiveConcurrency(lim, cfg.threads)
+		// each attempt took about N*T/A. N is the concurrency that actually
+		// ran, which the list size caps - using -t here reported a 24-name run
+		// as if 500 requests had been in flight.
+		workers := cfg.threads
+		if listSize > 0 && listSize < workers {
+			workers = listSize
+		}
+		cap := effectiveConcurrency(lim, workers)
 		if attempts > 0 && cap > 0 {
 			per := time.Duration(float64(cap) * secs / float64(attempts) * float64(time.Second))
 			row("Latency", cCyan(fmt.Sprintf("~%v per request", per.Round(time.Millisecond))))
 		}
 	}
 
-	printSpeedDiagnosis(cfg, counts, lim, pool)
+	printSpeedDiagnosis(cfg, counts, lim, pool, listSize)
 
 	// Error cause breakdown: this is what tells the user what to fix.
 	if len(counts.reasons) > 0 {
@@ -658,55 +613,52 @@ func printSummary(cfg *config, counts tally, elapsed time.Duration, interrupted 
 
 // ----------------------------------------------------------------- orchestration
 
-// runPipeline runs the worker pool and the single writer, returning the final
-// counters.
+// runPipeline runs the whole check: one worker pool and one writer, pulling
+// from a live work list until it empties or the context is cancelled.
 //
-// Shutdown order is critical: close the jobs channel, wait for the workers,
-// close the results channel, then wait for the writer to flush. Getting this
-// order wrong either truncates output silently or writes to a closed channel.
-func runPipeline(ctx context.Context, usernames []string, pool *proxyPool,
+// There are no rounds. Workers take the next free name, check it, and go
+// straight to the next one; in loop mode the list simply wraps around. Nothing
+// is torn down and rebuilt, so throughput never drops to zero and the rate
+// meters keep accumulating instead of restarting from nothing every pass.
+//
+// Shutdown order is critical: close the work list, wait for the workers, close
+// the results channel, then wait for the writer to flush. Getting this order
+// wrong either truncates output silently or writes to a closed channel.
+func runPipeline(ctx context.Context, wl *worklist, pool *proxyPool,
 	cache *clientCache, cfg *config, sink *resultSink, stats *liveStats,
-	lim *adaptiveLimiter, round int, start time.Time, prior tally) tally {
+	lim *adaptiveLimiter, start time.Time) tally {
 
-	jobs := make(chan string)
 	results := make(chan result, cfg.threads*2)
 
-	// Never start more workers than there are names: with -t 500 on a 20-name
-	// list the extra goroutines would just idle. This matters in loop mode,
-	// where the list shrinks as names are found.
-	workers := cfg.threads
-	if n := len(usernames); n > 0 && workers > n {
-		workers = n
-	}
+	// Cancellation has to reach workers parked waiting for a free name.
+	stopped := make(chan struct{})
+	defer close(stopped)
+	go func() {
+		select {
+		case <-ctx.Done():
+			wl.close()
+		case <-stopped:
+		}
+	}()
 
+	// Start the full thread count. Surplus workers park on the work list rather
+	// than duplicating a name that is already being checked, so a thread count
+	// larger than the list costs nothing but also buys nothing.
 	var wg sync.WaitGroup
-	for i := 0; i < workers; i++ {
+	for i := 0; i < cfg.threads; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			runWorker(ctx, jobs, results, pool, cache, cfg, stats, lim)
+			runWorker(ctx, wl, results, pool, cache, cfg, stats, lim)
 		}()
 	}
-
-	// Feeder: hands out usernames, then closes the jobs channel.
-	go func() {
-		defer close(jobs)
-		for _, u := range usernames {
-			select {
-			case jobs <- u:
-			case <-ctx.Done():
-				return
-			}
-		}
-	}()
 
 	// A single writer owns the output files, counters, and terminal, so the
 	// counters need no lock; the console is internally mutex-guarded.
 	con := newConsole(cfg)
 	writerDone := make(chan tally, 1)
 	go func() {
-		writerDone <- runWriter(results, cfg, con, sink, stats, pool, lim,
-			round, len(usernames), workers, start, prior)
+		writerDone <- runWriter(ctx, results, cfg, con, sink, stats, pool, lim, wl, start)
 	}()
 
 	wg.Wait()
@@ -718,22 +670,41 @@ func runPipeline(ctx context.Context, usernames []string, pool *proxyPool,
 
 // ---------------------------------------------------------------------- workers
 
-func runWorker(ctx context.Context, jobs <-chan string, results chan<- result,
+func runWorker(ctx context.Context, wl *worklist, results chan<- result,
 	pool *proxyPool, cache *clientCache, cfg *config, stats *liveStats,
 	lim *adaptiveLimiter) {
 
-	for username := range jobs {
-		if ctx.Err() != nil {
+	for {
+		username, ok := wl.claim(ctx)
+		if !ok {
 			return
 		}
 
 		if !validUsername(username) {
-			results <- result{username: username, status: statusInvalid}
+			// Drop it from the list rather than rechecking a name that can
+			// never be valid on every pass forever.
+			wl.retire(username)
+			select {
+			case results <- result{username: username, status: statusInvalid}:
+			case <-ctx.Done():
+				return
+			}
 			continue
 		}
 
 		res := checkWithRetries(ctx, username, pool, cache, cfg, stats, lim)
-		results <- res
+
+		// A name that came back available is finished with; the writer removes
+		// it from the list and the file. Anything else goes back into rotation.
+		if res.status != statusAvailable {
+			wl.release(username)
+		}
+
+		select {
+		case results <- res:
+		case <-ctx.Done():
+			return
+		}
 
 		if cfg.delay > 0 || cfg.jitter > 0 {
 			d := cfg.delay
@@ -992,9 +963,9 @@ func effectiveConcurrency(lim *adaptiveLimiter, workers int) int {
 	return n
 }
 
-func runWriter(results <-chan result, cfg *config, con *console, sink *resultSink,
-	stats *liveStats, pool *proxyPool, lim *adaptiveLimiter,
-	round, total, workers int, start time.Time, prior tally) tally {
+func runWriter(ctx context.Context, results <-chan result, cfg *config, con *console,
+	sink *resultSink, stats *liveStats, pool *proxyPool, lim *adaptiveLimiter,
+	wl *worklist, start time.Time) tally {
 
 	var counts tally
 
@@ -1009,9 +980,10 @@ func runWriter(results <-chan result, cfg *config, con *console, sink *resultSin
 	record := sink.record
 
 	// RPS/UPS are averaged over a trailing window rather than over the gap
-	// between two refreshes. attempts is cumulative across rounds, so the
-	// baseline is seeded from its current value: starting from zero would make
-	// the first tick of every round report the whole run as one burst.
+	// between two refreshes, which reads zero on any tick that happened to be
+	// empty. The writer now lives for the whole run, so these windows keep
+	// filling instead of being rebuilt from nothing on every pass over the list
+	// - which is what made a short list display a fixed, tiny rate.
 	rpsWin := newRateWindow(3 * time.Second)
 	upsWin := newRateWindow(3 * time.Second)
 	seededAt := time.Now()
@@ -1032,21 +1004,19 @@ func runWriter(results <-chan result, cfg *config, con *console, sink *resultSin
 		rps := rpsWin.add(now, float64(attempts))
 		ups := upsWin.add(now, float64(checked))
 
-		// The displayed counters are cumulative across rounds.
-		shown := prior
-		shown.add(counts)
-
+		left := wl.size()
 		con.status(buildStatus(appName, statusView{
-			Round:      round,
 			Loop:       cfg.loop,
+			Passes:     wl.passCount(),
 			RPS:        rps,
 			UPS:        ups,
 			Attempts:   attempts,
 			Checked:    checked,
-			Total:      total,
-			Counts:     shown,
+			Left:       left,
+			Counts:     counts,
 			Elapsed:    now.Sub(start),
-			Cus:        effectiveConcurrency(lim, workers),
+			Cus:        effectiveConcurrency(lim, usefulConcurrency(cfg.threads, left)),
+			Threads:    cfg.threads,
 			ProxiesOK:  pool.healthy(),
 			ProxiesAll: pool.len(),
 		}))
@@ -1065,8 +1035,36 @@ func runWriter(results <-chan result, cfg *config, con *console, sink *resultSin
 				return counts
 			}
 			handleResult(res, cfg, con, &counts, record, sink.flushBucket, &whwg)
+
+			// A hit is retired here, while everything else keeps running: the
+			// name leaves the live list and the file in one place, with no
+			// pause and no rebuild.
+			if res.status == statusAvailable && !cfg.keepList {
+				left := wl.retire(res.username)
+				if err := retireName(cfg, sink, res.username); err != nil {
+					warnf("cannot update %s: %v", cfg.usernamesFile, err)
+				} else {
+					con.log(cGreen(fmt.Sprintf("  + moved @%s to available.txt", res.username)) +
+						cGray(fmt.Sprintf("  - %d left", left)))
+				}
+				if left == 0 {
+					con.log(cGreen("  every name in the list is available - nothing left to watch."))
+					wl.close()
+				}
+			}
 		}
 	}
+}
+
+// retireName removes a found name from the usernames file. It refuses while the
+// result files are failing to write: deleting a name from the input on the
+// strength of a write that did not land destroys both records of it at once.
+func retireName(cfg *config, sink *resultSink, name string) error {
+	if sink.err != nil {
+		return fmt.Errorf("results are not being written (%w); leaving the list alone", sink.err)
+	}
+	_, err := removeFromList(cfg.usernamesFile, []string{name})
+	return err
 }
 
 // handleResult classifies one result: bumps the counter, writes it to its file,
@@ -1520,4 +1518,46 @@ func warnf(format string, args ...any) {
 func fatalf(format string, args ...any) {
 	fmt.Fprintf(os.Stderr, "[x] "+format+"\n", args...)
 	os.Exit(1)
+}
+
+// watchList re-reads the usernames file periodically so edits made while the
+// tool is running take effect. Nothing pauses for it: the list is swapped in
+// place and the workers carry on.
+//
+// Names already removed because they were found available are not resurrected -
+// they are gone from the file too, so a re-read simply does not contain them.
+func watchList(ctx context.Context, cfg *config, wl *worklist) {
+	const every = 5 * time.Second
+	t := time.NewTicker(every)
+	defer t.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+
+		names, err := loadLines(cfg.usernamesFile)
+		if err != nil || len(names) == 0 {
+			// A momentarily unreadable or empty file is not a reason to throw
+			// away a running watch list; the next tick tries again.
+			continue
+		}
+		if !sameNames(names, wl.snapshot()) {
+			wl.replace(names)
+		}
+	}
+}
+
+func sameNames(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
