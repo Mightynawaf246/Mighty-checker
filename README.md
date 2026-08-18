@@ -304,6 +304,19 @@ residential pools. `-per-proxy 0` removes the limit. But the honest answer to
 wanting more throughput from a fixed pool is **more proxies**, not more threads
 through the same ones.
 
+## Notifications
+
+`-webhook` posts to any endpoint that accepts a Discord-shaped `{"content": …}`
+body. Names are **batched**: one message every ten seconds carrying everything
+found since the last one, or sooner if a burst arrives.
+
+One request per hit does not survive a large run — a list of millions finds hits
+in bursts, so a goroutine and a POST each is an unbounded fan-out at exactly the
+busiest moment, into an endpoint that rate limits. A long batch is summarised
+rather than pasted in full, because most services reject a message past a couple
+of thousand characters: 5 000 names render to about 1 000, with a pointer to
+`available.txt` for the rest.
+
 ## Reading a rate that dropped
 
 `RPS` is roughly `CUS / LAT`, and the status line shows all three. When the rate
@@ -653,7 +666,7 @@ that is actually happening rather than flickering to zero whenever a single
 | `-http2` | use HTTP/2 (one connection per host, far less parallel) | — |
 | `-verbose` | log every result, not just available | — |
 | `-no-color` | disable colors and the live status line | — |
-| `-webhook` | webhook URL notified on an available name | — |
+| `-webhook` | webhook URL, notified in batches as names are found | — |
 | `-menu` | force the interactive menu | — |
 | `-no-prompt` | never show the interactive menu | — |
 | `-update` | check for a new version and update in place | — |

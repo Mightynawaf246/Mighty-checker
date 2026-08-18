@@ -70,14 +70,84 @@ func (c *console) log(s string) {
 }
 
 // status draws the live status line in place (terminals only).
+//
+// The line is trimmed to the console width first. Erasing it is a carriage
+// return and a clear-to-end-of-LINE, so a line that wrapped leaves everything
+// above the last row on screen: the status stops updating in place and starts
+// stacking up copies of itself instead. cmd.exe is 80 columns by default and
+// the full line runs past 160, so this is the normal case on Windows rather
+// than an edge one.
 func (c *console) status(s string) {
 	if c == nil || !c.live {
 		return
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
+	if w := terminalWidth(); w > 8 {
+		// One column short of the edge: writing into the last cell makes some
+		// terminals wrap anyway.
+		s = truncateVisible(s, w-1)
+	}
 	c.lastLine = s
 	fmt.Print("\r\033[K" + s)
+}
+
+// truncateVisible cuts a string to max VISIBLE characters, counting escape
+// sequences as zero width and never cutting one in half. A colour left open by
+// the cut is closed, so the trim cannot bleed into whatever prints next.
+func truncateVisible(s string, max int) string {
+	if max <= 0 {
+		return ""
+	}
+	var b strings.Builder
+	visible := 0
+	sawEscape := false
+
+	// A CSI sequence is ESC, then '[', then parameters, then one final byte in
+	// the range @ to ~. The '[' is itself 0x5B and so falls inside that range:
+	// treating it as the terminator ends the sequence immediately and counts
+	// the colour digits that follow as visible text.
+	const (
+		plain = iota
+		afterESC
+		inCSI
+	)
+	state := plain
+
+	for _, r := range s {
+		switch state {
+		case afterESC:
+			b.WriteRune(r)
+			if r == '[' {
+				state = inCSI
+			} else {
+				state = plain // a two-character escape
+			}
+			continue
+		case inCSI:
+			b.WriteRune(r)
+			if r >= 0x40 && r <= 0x7E {
+				state = plain
+			}
+			continue
+		}
+		if r == 0x1B {
+			state = afterESC
+			sawEscape = true
+			b.WriteRune(r)
+			continue
+		}
+		if visible >= max {
+			if sawEscape {
+				b.WriteString("\033[0m")
+			}
+			return b.String()
+		}
+		b.WriteRune(r)
+		visible++
+	}
+	return b.String()
 }
 
 // clearStatus removes the status line for good once the work is done.

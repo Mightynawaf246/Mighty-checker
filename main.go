@@ -1275,11 +1275,11 @@ func runWriter(ctx context.Context, results <-chan result, cfg *config, con *con
 
 	var counts tally
 
-	// Webhooks fire on their own goroutines so they never block the writer; we
-	// wait for all of them before returning so their lines land before the summary.
-	var whwg sync.WaitGroup
+	// Webhooks are batched and sent from their own goroutine, so a burst of
+	// hits never fans out one request per hit from the writer.
+	hooks := newWebhookNotifier(ctx, cfg.webhook, con)
 	defer func() {
-		whwg.Wait()
+		hooks.stop()
 		sink.flush()
 	}()
 
@@ -1371,7 +1371,7 @@ func runWriter(ctx context.Context, results <-chan result, cfg *config, con *con
 			if wl.retiredName(res.username) {
 				continue
 			}
-			handleResult(res, cfg, con, &counts, record, sink.flushBucket, &whwg)
+			handleResult(res, cfg, con, &counts, record, sink.flushBucket, hooks)
 
 			// This goroutine is the single owner of the list's lifecycle, so
 			// retirement happens here and nowhere else.
@@ -1418,7 +1418,7 @@ func runWriter(ctx context.Context, results <-chan result, cfg *config, con *con
 // everything in verbose mode, keeping the live status line clean.
 func handleResult(res result, cfg *config, con *console,
 	counts *tally, record func(string, string), flushNow func(string),
-	whwg *sync.WaitGroup) {
+	hooks *webhookNotifier) {
 
 	// In debug mode dump exactly what came back, before classifying. This is the
 	// only way to see why a name was judged the way it was.
@@ -1449,13 +1449,7 @@ func handleResult(res result, cfg *config, con *console,
 		} else {
 			con.log(cGreen("  ! Available : @" + res.username))
 		}
-		if cfg.webhook != "" {
-			whwg.Add(1)
-			go func(name string) {
-				defer whwg.Done()
-				notifyAvailable(con, cfg.webhook, name)
-			}(res.username)
-		}
+		hooks.add(res.username)
 
 	case statusTaken:
 		counts.taken++

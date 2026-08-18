@@ -860,45 +860,41 @@ func TestFailedAttemptsAreNotCountedAsLatency(t *testing.T) {
 
 // A proxy is a machine with a connection limit, and past it requests do not
 // fail, they queue - so overloading a pool shows up as latency, not errors, and
-// adding threads makes it worse. Respecting the pool's capacity must therefore
-// beat brute force at the SAME thread count.
+// adding threads makes it worse. The ceiling exists to stop that, and what it
+// has to do is hold the number of requests in flight down to what the pool can
+// carry, even when -t asks for far more.
 //
-// Modelled on a real run: 100 proxies driven at 2089 concurrent checks, where
-// round trips had stretched to three seconds.
-func TestRespectingProxyCapacityBeatsBruteForce(t *testing.T) {
-	run := func(ceiling int) (float64, time.Duration) {
-		const proxies, comfy = 100, 10
+// Measured as peak concurrency at the endpoint. An earlier version of this test
+// raced two pipelines and compared wall-clock throughput, which said the same
+// thing unreliably: a few seconds of timing on a shared machine under -race is
+// mostly noise.
+func TestCapacityCeilingHoldsConcurrencyDown(t *testing.T) {
+	peakWith := func(ceiling int) int {
 		var mu sync.Mutex
-		live := make([]int, proxies)
-		next := 0
+		live, peak := 0, 0
 
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			mu.Lock()
-			id := next % proxies
-			next++
-			live[id]++
-			over := live[id] - comfy
+			live++
+			if live > peak {
+				peak = live
+			}
 			mu.Unlock()
 
-			d := 40 * time.Millisecond
-			if over > 0 {
-				d += time.Duration(over) * 45 * time.Millisecond // queueing
-			}
-			time.Sleep(d)
+			time.Sleep(40 * time.Millisecond)
 
 			mu.Lock()
-			live[id]--
+			live--
 			mu.Unlock()
 			fmt.Fprint(w, bodyTaken)
 		}))
 		defer srv.Close()
 		withEndpoint(t, srv.URL)
 
-		const threads = 1000
+		const threads = 1200
 		cfg := &config{threads: threads, timeout: 60 * time.Second, retries: 1,
 			outDir: t.TempDir(), quiet: true, loop: true}
 		wl := newWorklist([]string{"a", "b", "c"}, true)
-		stats := &liveStats{}
 		sink := newResultSink(cfg)
 		lim := newAdaptiveLimiter(threads, true)
 		if ceiling > 0 {
@@ -907,29 +903,28 @@ func TestRespectingProxyCapacityBeatsBruteForce(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()
 
-		start := time.Now()
 		runPipeline(ctx, wl, newProxyPool(nil), newClientCacheFor(cfg.timeout, threads, 0),
-			cfg, sink, stats, lim, nil, start)
-		el := time.Since(start)
+			cfg, sink, &liveStats{}, lim, nil, time.Now())
 		sink.close()
 
-		var lat time.Duration
-		if c := stats.latencyCount.Load(); c > 0 {
-			lat = time.Duration(stats.latencyNanos.Load() / c)
-		}
-		return float64(stats.attempts.Load()) / el.Seconds(), lat
+		mu.Lock()
+		defer mu.Unlock()
+		return peak
 	}
 
-	brute, bruteLat := run(0)
-	capped, cappedLat := run(100 * 10)
-	t.Logf("brute force: %.0f req/s at %v   capacity respected: %.0f req/s at %v",
-		brute, bruteLat.Round(time.Millisecond), capped, cappedLat.Round(time.Millisecond))
+	// 30 proxies at 10 each: the pool carries 300, whatever -t says.
+	const ceiling = 300
+	capped := peakWith(ceiling)
+	unbounded := peakWith(0)
 
-	if capped <= brute {
-		t.Errorf("respecting capacity did not help: %.0f -> %.0f req/s", brute, capped)
+	t.Logf("peak in flight: %d unbounded, %d with a ceiling of %d",
+		unbounded, capped, ceiling)
+
+	if capped > ceiling+20 {
+		t.Errorf("the ceiling of %d let %d requests in flight", ceiling, capped)
 	}
-	if cappedLat >= bruteLat {
-		t.Errorf("respecting capacity did not reduce latency: %v -> %v", bruteLat, cappedLat)
+	if unbounded <= capped {
+		t.Errorf("test premise wrong: unbounded peaked at %d, capped at %d", unbounded, capped)
 	}
 }
 
@@ -1196,4 +1191,71 @@ func TestWatchListOnlyReloadsOnChange(t *testing.T) {
 		time.Sleep(200 * time.Millisecond)
 	}
 	t.Errorf("the watcher never picked up a real edit: %d live", wl.size())
+}
+
+// visibleWidth counts the printable columns of a string, ignoring ANSI
+// sequences - the same job truncateVisible does, written independently so the
+// test does not inherit the function's own mistakes.
+func visibleWidth(s string) int {
+	n := 0
+	rs := []rune(s)
+	for i := 0; i < len(rs); i++ {
+		if rs[i] != 0x1B {
+			n++
+			continue
+		}
+		i++ // ESC
+		if i < len(rs) && rs[i] == '[' {
+			i++
+			for i < len(rs) && !(rs[i] >= 0x40 && rs[i] <= 0x7E) {
+				i++
+			}
+		}
+	}
+	return n
+}
+
+// The status line is erased with a carriage return and a clear-to-end-of-LINE,
+// so a line wider than the console leaves everything above the last row on
+// screen: the status stops updating in place and stacks copies of itself
+// instead. cmd.exe is 80 columns and the full line runs past 160, so it has to
+// be trimmed to fit - without cutting an escape sequence in half.
+func TestStatusLineFitsTheConsole(t *testing.T) {
+	line := buildStatus("Mighty", statusView{
+		Loop: true, Passes: 12, RPS: 21823, UPS: 21804, Attempts: 4219719,
+		Checked: 4210998, Left: 4972, Cus: 2000, Threads: 2000,
+		Latency: 240 * time.Millisecond, Fresh: 1200 * time.Millisecond,
+		ProxiesOK: 197, ProxiesAll: 200,
+		Counts:  tally{available: 3, taken: 900, unknown: 5, errored: 2},
+		Elapsed: time.Hour + 43*time.Minute,
+	})
+	full := visibleWidth(line)
+	t.Logf("full status line is %d visible columns", full)
+	if full < 100 {
+		t.Fatalf("test premise wrong: the line is only %d columns", full)
+	}
+
+	for _, width := range []int{40, 79, 80, 120, 200} {
+		got := truncateVisible(line, width)
+		if w := visibleWidth(got); w > width {
+			t.Errorf("width %d: produced %d visible columns", width, w)
+		}
+		// An escape must never be left half-written.
+		if strings.Count(got, "\x1b") > 0 && !strings.HasSuffix(got, "m") {
+			t.Errorf("width %d: ends mid-escape: %q", width, got[max(0, len(got)-12):])
+		}
+	}
+
+	// Colour must survive a trim, not bleed past it.
+	trimmed := truncateVisible(line, 40)
+	if strings.Contains(trimmed, "\x1b") && !strings.Contains(trimmed, "\x1b[0m") {
+		t.Error("a trimmed line does not reset colour, so it bleeds into the next output")
+	}
+	if got := truncateVisible(line, 0); got != "" {
+		t.Errorf("zero width should produce nothing, got %q", got)
+	}
+	// Plain text with no escapes must trim exactly.
+	if got := truncateVisible("abcdefghij", 4); got != "abcd" {
+		t.Errorf("plain trim: %q", got)
+	}
 }
