@@ -69,6 +69,27 @@ func (c *console) log(s string) {
 	}
 }
 
+// warn prints a warning through the same lock as everything else, so a
+// background goroutine cannot write over the live status line.
+//
+// It goes to stderr, like warnf, and still says something when there is no
+// console at all - a warning lost in quiet mode is a warning that mattered.
+func (c *console) warn(s string) {
+	if c == nil {
+		warnf("%s", s)
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.live && c.lastLine != "" {
+		fmt.Print("\r\033[K")
+	}
+	fmt.Fprintln(os.Stderr, "[!] "+s)
+	if c.live && c.lastLine != "" {
+		fmt.Print(c.lastLine)
+	}
+}
+
 // status draws the live status line in place (terminals only).
 //
 // The line is trimmed to the console width first. Erasing it is a carriage

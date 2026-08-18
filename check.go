@@ -21,6 +21,14 @@ const (
 	// gateway error. Keeping the cap tight bounds both the read and the
 	// lowercased copy the classifier makes of every single response.
 	maxBodyBytes = 64 << 10
+
+	// How much of an oversized body is drained before the connection is given
+	// up on. Draining is what lets a connection be reused, so it is worth a
+	// little reading - but only a little: past this the remainder is unbounded,
+	// and reading a hostile or misconfigured proxy's endless stream to the end
+	// costs the whole -timeout for a connection that is worth a fraction of it.
+	// Closing without draining just costs one new handshake.
+	maxDrainBytes = 32 << 10
 )
 
 // Check outcomes.
@@ -282,15 +290,16 @@ func containsAny(s string, subs ...string) bool {
 }
 
 // response is one raw reply from the endpoint, before classification.
+// Retry-After is deliberately not read here. The endpoint sends it under
+// throttling, and honouring it is worse than ignoring it: every worker
+// throttled in the same instant would then sleep for exactly the same duration
+// and wake in the same instant, throttling each other again. Global
+// back-pressure is the limiter's job, and the remedy for one throttled IP is
+// the next proxy rather than the clock. See checkWithRetries.
 type response struct {
 	code     int
 	body     string
 	location string
-
-	// retryAfter is the Retry-After header, when the endpoint sent one. It is
-	// the only reliable hint about how long a throttle will last, so waiting
-	// exactly that long beats guessing.
-	retryAfter string
 }
 
 // checkOnce performs a single check attempt through the given client.
@@ -304,16 +313,16 @@ func checkOnce(ctx context.Context, client *http.Client, target string) (respons
 	if err != nil {
 		return response{}, err
 	}
-	// The body must be drained and closed, otherwise the connection is not reused.
+	// The body must be drained and closed, otherwise the connection is not
+	// reused - but only up to a point; see maxDrainBytes.
 	defer func() {
-		io.Copy(io.Discard, resp.Body)
+		io.CopyN(io.Discard, resp.Body, maxDrainBytes)
 		resp.Body.Close()
 	}()
 
 	r := response{
-		code:       resp.StatusCode,
-		location:   resp.Header.Get("Location"),
-		retryAfter: resp.Header.Get("Retry-After"),
+		code:     resp.StatusCode,
+		location: resp.Header.Get("Location"),
 	}
 
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxBodyBytes))

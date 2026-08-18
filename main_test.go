@@ -67,7 +67,7 @@ func runOnce(ctx context.Context, usernames []string, pool *proxyPool, cfg *conf
 	sink := newResultSink(cfg)
 	defer sink.close()
 	return runPipeline(ctx, newWorklist(usernames, cfg.loop), pool, newClientCache(cfg.timeout), cfg,
-		sink, &liveStats{}, newAdaptiveLimiter(cfg.threads, true), nil, time.Now())
+		sink, &liveStats{}, newAdaptiveLimiter(cfg.threads, true), nil, time.Now(), newConsole(cfg))
 }
 
 func withEndpoint(t *testing.T, url string) {
@@ -301,7 +301,7 @@ func TestLoopIsContinuousAndDoesNotRepeatFileLines(t *testing.T) {
 	}()
 
 	counts := runPipeline(ctx, wl, newProxyPool(nil), newClientCache(cfg.timeout),
-		cfg, sink, stats, newAdaptiveLimiter(cfg.threads, true), nil, time.Now())
+		cfg, sink, stats, newAdaptiveLimiter(cfg.threads, true), nil, time.Now(), newConsole(cfg))
 	sink.close()
 	cancel()
 
@@ -494,12 +494,12 @@ func TestWatchesNamesUntilTheyFreeUp(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	pruner := newListPruner(ctx, cfg, sink)
+	pruner := newListPruner(ctx, cfg, sink, newConsole(cfg), &fileStamp{})
 	done := make(chan tally, 1)
 	go func() {
 		done <- runPipeline(ctx, wl, newProxyPool(nil),
 			newClientCacheFor(cfg.timeout, cfg.threads, 0), cfg, sink,
-			&liveStats{}, newAdaptiveLimiter(cfg.threads, true), pruner, time.Now())
+			&liveStats{}, newAdaptiveLimiter(cfg.threads, true), pruner, time.Now(), newConsole(cfg))
 	}()
 
 	select {
@@ -914,7 +914,7 @@ func TestUnknownAnswersDoNotCutConcurrency(t *testing.T) {
 
 	sink := newResultSink(cfg)
 	counts := runPipeline(context.Background(), newWorklist(usernames, cfg.loop), newProxyPool(nil),
-		newClientCacheFor(cfg.timeout, cfg.threads, 0), cfg, sink, &liveStats{}, lim, nil, time.Now())
+		newClientCacheFor(cfg.timeout, cfg.threads, 0), cfg, sink, &liveStats{}, lim, nil, time.Now(), newConsole(cfg))
 	sink.close()
 
 	if counts.unknown != len(usernames) {
@@ -945,7 +945,7 @@ func TestThrottleResponsesCutConcurrency(t *testing.T) {
 
 	sink := newResultSink(cfg)
 	runPipeline(context.Background(), newWorklist(usernames, cfg.loop), newProxyPool(nil),
-		newClientCacheFor(cfg.timeout, cfg.threads, 0), cfg, sink, &liveStats{}, lim, nil, time.Now())
+		newClientCacheFor(cfg.timeout, cfg.threads, 0), cfg, sink, &liveStats{}, lim, nil, time.Now(), newConsole(cfg))
 	sink.close()
 
 	if got := lim.current(); got >= cfg.threads {
@@ -999,7 +999,7 @@ func TestNoAdaptKeepsFullConcurrencyUnderThrottling(t *testing.T) {
 
 	sink := newResultSink(cfg)
 	counts := runPipeline(context.Background(), newWorklist(usernames, cfg.loop), newProxyPool(nil),
-		newClientCacheFor(cfg.timeout, cfg.threads, 0), cfg, sink, &liveStats{}, lim, nil, time.Now())
+		newClientCacheFor(cfg.timeout, cfg.threads, 0), cfg, sink, &liveStats{}, lim, nil, time.Now(), newConsole(cfg))
 	sink.close()
 
 	if counts.total() != len(usernames) {

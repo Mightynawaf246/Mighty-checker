@@ -47,6 +47,10 @@ type worklist struct {
 	retired map[string]bool
 	live    int
 
+	// retireGen counts retirements. replace does its counting without the lock
+	// held, and uses this to notice that a name was retired underneath it.
+	retireGen uint64
+
 	cycle  bool // keep going round forever (loop mode)?
 	pos    int  // rotation cursor, cycling mode
 	next   int  // one-way cursor, single-pass mode
@@ -130,6 +134,7 @@ func (w *worklist) retire(name string) int {
 	key := strings.ToLower(name)
 	if !w.retired[key] {
 		w.retired[key] = true
+		w.retireGen++
 		if w.live > 0 {
 			w.live--
 		}
@@ -139,15 +144,46 @@ func (w *worklist) retire(name string) int {
 
 // replace swaps in a new set of names, so edits to the file take effect without
 // interrupting the run. Names already retired stay retired.
+//
+// The copying and the counting are done OUTSIDE the lock. Every worker takes
+// this lock on every single claim, so holding it across a walk of the whole
+// list stops the entire run for as long as that walk takes - about a third of a
+// second on two million names, on a path that fires whenever the file changes.
+// Only the swap itself needs the lock.
 func (w *worklist) replace(names []string) {
 	w.mu.Lock()
-	defer w.mu.Unlock()
+	retired := make(map[string]bool, len(w.retired))
+	for k := range w.retired {
+		retired[k] = true
+	}
+	gen := w.retireGen
+	w.mu.Unlock()
 
-	w.names = append([]string(nil), names...)
-	w.live = 0
-	for _, n := range w.names {
-		if !w.retired[strings.ToLower(n)] {
-			w.live++
+	// The expensive part, with nothing blocked behind it. The retired set is
+	// the number of names FOUND, which is tiny next to the list itself.
+	fresh := append([]string(nil), names...)
+	live := 0
+	for _, n := range fresh {
+		if !retired[strings.ToLower(n)] {
+			live++
+		}
+	}
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.names = fresh
+	if w.retireGen == gen {
+		w.live = live
+	} else {
+		// A name was retired while we were counting, so the count is stale by
+		// an unknown amount. Redo it under the lock - correctness matters more
+		// than the stall, and this only happens when a hit lands inside the
+		// window.
+		w.live = 0
+		for _, n := range w.names {
+			if !w.retired[strings.ToLower(n)] {
+				w.live++
+			}
 		}
 	}
 	if w.pos >= len(w.names) {

@@ -650,12 +650,31 @@ func (c *clientCache) clientFor(p *proxySpec) (*http.Client, error) {
 		tr.TLSClientConfig.NextProtos = []string{"http/1.1"}
 	}
 
+	// Bound the dial itself.
+	//
+	// Leaving Transport.DialContext nil does NOT inherit -timeout: net/http
+	// falls back to a zero-value net.Dialer, which has no timeout at all, and
+	// it dials with context.WithoutCancel(reqCtx) - so neither the request's
+	// deadline nor its cancellation reaches the dial either. Abandoning the
+	// request does not stop it: the transport deliberately lets a dial finish
+	// so the connection can still join the idle pool.
+	//
+	// The practical effect on a stale proxy list, where a dead host drops the
+	// SYN rather than refusing it: the request fails at -timeout, but the dial
+	// goroutine and its socket stay alive until the operating system gives up -
+	// about two minutes on Linux. Every retry through that proxy starts another
+	// one, and nothing caps how many pile up. The SOCKS paths below have always
+	// bounded their own dials for exactly this reason; HTTP and direct
+	// connections were the ones left unguarded.
+	dialer := &net.Dialer{Timeout: c.timeout, KeepAlive: 30 * time.Second}
+
 	switch {
 	case p == nil:
 		// "Direct" connection: honor HTTP_PROXY/HTTPS_PROXY/NO_PROXY the way
 		// http.DefaultTransport does, so the tool works behind a corporate or
 		// container proxy with no extra setup. Unset means genuinely direct.
 		tr.Proxy = http.ProxyFromEnvironment
+		tr.DialContext = dialer.DialContext
 
 	case p.Kind == proxyHTTP:
 		u := &url.URL{Scheme: p.Scheme, Host: p.Addr()}
@@ -665,6 +684,7 @@ func (c *clientCache) clientFor(p *proxySpec) (*http.Client, error) {
 		// The standard library handles the Proxy-Authorization header and the
 		// CONNECT tunnel when the target is https.
 		tr.Proxy = http.ProxyURL(u)
+		tr.DialContext = dialer.DialContext
 
 	case p.Kind == proxySOCKS5:
 		proxyAddr, user, pass, resolve := p.Addr(), p.User, p.Pass, p.ResolveLocally

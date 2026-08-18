@@ -334,11 +334,11 @@ func TestSinkLatchesWriteErrors(t *testing.T) {
 	}
 	sink.flush()
 
-	if sink.err == nil {
+	if sink.failure() == nil {
 		t.Fatal("a failed write was not recorded")
 	}
-	if !strings.Contains(sink.err.Error(), "available.txt") {
-		t.Errorf("error should name the file: %v", sink.err)
+	if !strings.Contains(sink.failure().Error(), "available.txt") {
+		t.Errorf("error should name the file: %v", sink.failure())
 	}
 }
 
@@ -533,7 +533,7 @@ func TestThrottlingDoesNotEmptyTheProxyPool(t *testing.T) {
 	}
 	sink := newResultSink(cfg)
 	runPipeline(context.Background(), newWorklist(names, cfg.loop), pool,
-		newClientCacheFor(cfg.timeout, cfg.threads, 0), cfg, sink, &liveStats{}, newAdaptiveLimiter(cfg.threads, true), nil, time.Now())
+		newClientCacheFor(cfg.timeout, cfg.threads, 0), cfg, sink, &liveStats{}, newAdaptiveLimiter(cfg.threads, true), nil, time.Now(), newConsole(cfg))
 	sink.close()
 
 	// Nothing to quarantine with a direct connection, but the accounting must
@@ -689,7 +689,7 @@ func TestKeepListDoesNotRepeatAHit(t *testing.T) {
 
 	counts := runPipeline(ctx, wl, newProxyPool(nil),
 		newClientCacheFor(cfg.timeout, cfg.threads, 0), cfg, sink, &liveStats{},
-		newAdaptiveLimiter(cfg.threads, true), nil, time.Now())
+		newAdaptiveLimiter(cfg.threads, true), nil, time.Now(), newConsole(cfg))
 	sink.close()
 
 	if counts.available != 1 {
@@ -724,10 +724,10 @@ func TestFoundNameLeavesRotationAndFile(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	pruner := newListPruner(ctx, cfg, sink)
+	pruner := newListPruner(ctx, cfg, sink, newConsole(cfg), &fileStamp{})
 	counts := runPipeline(ctx, wl, newProxyPool(nil),
 		newClientCacheFor(cfg.timeout, cfg.threads, 0), cfg, sink, &liveStats{},
-		newAdaptiveLimiter(cfg.threads, true), pruner, time.Now())
+		newAdaptiveLimiter(cfg.threads, true), pruner, time.Now(), newConsole(cfg))
 	pruner.stop() // flushes the batch
 	sink.close()
 
@@ -822,7 +822,7 @@ func TestLatencyInstrumentTracksASlowdown(t *testing.T) {
 	}()
 
 	runPipeline(ctx, wl, newProxyPool(nil), newClientCacheFor(cfg.timeout, cfg.threads, 0),
-		cfg, sink, stats, newAdaptiveLimiter(cfg.threads, true), nil, time.Now())
+		cfg, sink, stats, newAdaptiveLimiter(cfg.threads, true), nil, time.Now(), newConsole(cfg))
 	sink.close()
 
 	fast, slowed := <-sample, <-sample
@@ -904,7 +904,7 @@ func TestCapacityCeilingHoldsConcurrencyDown(t *testing.T) {
 		defer cancel()
 
 		runPipeline(ctx, wl, newProxyPool(nil), newClientCacheFor(cfg.timeout, threads, 0),
-			cfg, sink, &liveStats{}, lim, nil, time.Now())
+			cfg, sink, &liveStats{}, lim, nil, time.Now(), newConsole(cfg))
 		sink.close()
 
 		mu.Lock()
@@ -1030,7 +1030,7 @@ func TestPrunerBatchesRemovals(t *testing.T) {
 	defer cancel()
 
 	var flushes, removed int
-	p := newListPruner(ctx, cfg, sink)
+	p := newListPruner(ctx, cfg, sink, newConsole(cfg), &fileStamp{})
 	p.flushed = func(n, _ int) { flushes++; removed += n }
 
 	for i := 0; i < 50; i++ {
@@ -1080,7 +1080,7 @@ func TestPrunerFlushesOnLargeBatch(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	p := newListPruner(ctx, cfg, sink)
+	p := newListPruner(ctx, cfg, sink, newConsole(cfg), &fileStamp{})
 	for i := 0; i < pruneBatchLimit; i++ {
 		p.add(fmt.Sprintf("user%d", i))
 	}
@@ -1101,11 +1101,11 @@ func TestPrunerRefusesWhenResultsAreFailing(t *testing.T) {
 
 	cfg := &config{usernamesFile: path, outDir: dir, quiet: true}
 	sink := newResultSink(cfg)
-	sink.err = fmt.Errorf("disk full")
+	sink.fail(fmt.Errorf("disk full"))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	p := newListPruner(ctx, cfg, sink)
+	p := newListPruner(ctx, cfg, sink, newConsole(cfg), &fileStamp{})
 	p.add("alpha")
 	p.stop()
 
@@ -1165,7 +1165,7 @@ func TestWatchListOnlyReloadsOnChange(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go watchList(ctx, cfg, wl)
+	go watchList(ctx, cfg, wl, &fileStamp{})
 
 	// Retire one name from the rotation WITHOUT touching the file. A watcher
 	// that reloads unconditionally would put it back.

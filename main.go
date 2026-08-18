@@ -158,7 +158,35 @@ type resultSink struct {
 	// error, so a full disk produced a run that reported hits on screen, fired
 	// webhooks for them, and then deleted them from the usernames file, while
 	// available.txt received nothing. The caller checks this before pruning.
-	err error
+	//
+	// It is the one field here that is not owned by the writer goroutine alone:
+	// the pruner reads it from its own goroutine before every rewrite, to
+	// decide whether the results it is about to delete names on the strength of
+	// actually landed. So it - and only it - is guarded.
+	errMu sync.Mutex
+	err   error
+}
+
+// fail latches the first write failure.
+func (s *resultSink) fail(err error) {
+	if err == nil {
+		return
+	}
+	s.errMu.Lock()
+	defer s.errMu.Unlock()
+	if s.err == nil {
+		s.err = err
+	}
+}
+
+// failure reports the first write failure, or nil. Safe from any goroutine.
+func (s *resultSink) failure() error {
+	if s == nil {
+		return nil
+	}
+	s.errMu.Lock()
+	defer s.errMu.Unlock()
+	return s.err
 }
 
 func newResultSink(cfg *config) *resultSink {
@@ -227,8 +255,8 @@ func (s *resultSink) record(bucket, line string) {
 		s.seen[key] = true
 	}
 	if w, ok := s.writers[bucket]; ok {
-		if _, err := fmt.Fprintln(w, line); err != nil && s.err == nil {
-			s.err = fmt.Errorf("writing to %s.txt: %w", bucket, err)
+		if _, err := fmt.Fprintln(w, line); err != nil {
+			s.fail(fmt.Errorf("writing to %s.txt: %w", bucket, err))
 		}
 	}
 }
@@ -236,8 +264,8 @@ func (s *resultSink) record(bucket, line string) {
 // flush pushes buffers to disk without closing them (between rounds).
 func (s *resultSink) flush() {
 	for name, w := range s.writers {
-		if err := w.Flush(); err != nil && s.err == nil {
-			s.err = fmt.Errorf("flushing %s.txt: %w", name, err)
+		if err := w.Flush(); err != nil {
+			s.fail(fmt.Errorf("flushing %s.txt: %w", name, err))
 		}
 	}
 }
@@ -247,8 +275,8 @@ func (s *resultSink) flush() {
 // than waiting for the end of a round that may last hours.
 func (s *resultSink) flushBucket(bucket string) {
 	if w, ok := s.writers[bucket]; ok {
-		if err := w.Flush(); err != nil && s.err == nil {
-			s.err = fmt.Errorf("flushing %s.txt: %w", bucket, err)
+		if err := w.Flush(); err != nil {
+			s.fail(fmt.Errorf("flushing %s.txt: %w", bucket, err))
 		}
 	}
 }
@@ -256,8 +284,8 @@ func (s *resultSink) flushBucket(bucket string) {
 func (s *resultSink) close() {
 	s.flush()
 	for name, f := range s.files {
-		if err := f.Close(); err != nil && s.err == nil {
-			s.err = fmt.Errorf("closing %s.txt: %w", name, err)
+		if err := f.Close(); err != nil {
+			s.fail(fmt.Errorf("closing %s.txt: %w", name, err))
 		}
 	}
 }
@@ -480,28 +508,29 @@ func main() {
 	// forever; otherwise it is exhausted once and the run ends.
 	wl := newWorklist(usernames, cfg.loop)
 
-	// While looping, pick up edits to the usernames file without interrupting
-	// anything. The file is the user's to change mid-run, and re-reading it used
-	// to be possible only at a round boundary.
-	if cfg.loop {
-		go watchList(ctx, cfg, wl)
-	}
-
 	stats := &liveStats{}
 	start := time.Now()
+
+	con := newConsole(cfg)
+
+	// The pruner rewrites the usernames file; the watcher polls it for edits.
+	// This is how the watcher tells one from the other.
+	selfWrites := &fileStamp{}
 
 	// Found names leave the usernames file in batches, off the result path.
 	var pruner *listPruner
 	if !cfg.keepList {
-		pruner = newListPruner(ctx, cfg, sink)
-		pruner.flushed = func(removed, remaining int) {
-			fmt.Printf("%s %s\n",
-				cGreen(fmt.Sprintf("[+] moved %d name(s) out of %s", removed, cfg.usernamesFile)),
-				cGray(fmt.Sprintf("- %d left", remaining)))
-		}
+		pruner = newListPruner(ctx, cfg, sink, con, selfWrites)
 	}
 
-	counts := runPipeline(ctx, wl, pool, cache, cfg, sink, stats, lim, pruner, start)
+	// While looping, pick up edits to the usernames file without interrupting
+	// anything. The file is the user's to change mid-run, and re-reading it used
+	// to be possible only at a round boundary.
+	if cfg.loop {
+		go watchList(ctx, cfg, wl, selfWrites)
+	}
+
+	counts := runPipeline(ctx, wl, pool, cache, cfg, sink, stats, lim, pruner, start, con)
 	pruner.stop()
 	sink.flush()
 
@@ -803,9 +832,18 @@ func printConfig(cfg *config, usernames []string, pool *proxyPool) {
 		carry := n * cfg.perProxy
 		text := fmt.Sprintf("%d in flight per proxy - %d proxies carry %d at once",
 			cfg.perProxy, n, carry)
-		if carry < cfg.threads {
+		switch {
+		case cfg.noAdapt:
+			// The ceiling is enforced by the adaptive limiter, so -no-adapt
+			// turns it off along with everything else. Printing it as if it
+			// still applied told the user their pool was protected when it
+			// was not.
+			row("Capacity", cYellow(fmt.Sprintf(
+				"%d per proxy - NOT enforced, -no-adapt drives all %d threads regardless",
+				cfg.perProxy, cfg.threads)))
+		case carry < cfg.threads:
 			row("Capacity", cYellow(text+fmt.Sprintf(", below -t %d", cfg.threads)))
-		} else {
+		default:
 			row("Capacity", cGreen(text))
 		}
 	}
@@ -927,7 +965,7 @@ func printSummary(cfg *config, counts tally, elapsed time.Duration, interrupted 
 // wrong either truncates output silently or writes to a closed channel.
 func runPipeline(ctx context.Context, wl *worklist, pool *proxyPool,
 	cache *clientCache, cfg *config, sink *resultSink, stats *liveStats,
-	lim *adaptiveLimiter, pruner *listPruner, start time.Time) tally {
+	lim *adaptiveLimiter, pruner *listPruner, start time.Time, con *console) tally {
 
 	results := make(chan result, cfg.threads*2)
 
@@ -954,9 +992,8 @@ func runPipeline(ctx context.Context, wl *worklist, pool *proxyPool,
 		}()
 	}
 
-	// A single writer owns the output files, counters, and terminal, so the
-	// counters need no lock; the console is internally mutex-guarded.
-	con := newConsole(cfg)
+	// A single writer owns the output files and counters, so those need no
+	// lock; the console is shared with the pruner and is mutex-guarded.
 	writerDone := make(chan tally, 1)
 	go func() {
 		writerDone <- runWriter(ctx, results, cfg, con, sink, stats, pool, lim, wl, pruner, start)
@@ -1018,15 +1055,14 @@ func runWorker(ctx context.Context, wl *worklist, results chan<- result,
 // attemptOnce performs one check through one proxy and reports what happened,
 // feeding proxy health and the adaptive limiter.
 type attemptOutcome struct {
-	status     string
-	code       int
-	location   string
-	body       string
-	retryAfter string
-	retryable  bool
-	err        error
-	proxy      string
-	spec       *proxySpec
+	status    string
+	code      int
+	location  string
+	body      string
+	retryable bool
+	err       error
+	proxy     string
+	spec      *proxySpec
 }
 
 func attemptOnce(ctx context.Context, username string, pool *proxyPool,
@@ -1081,7 +1117,6 @@ func attemptOnce(ctx context.Context, username string, pool *proxyPool,
 	}
 
 	out.code, out.body, out.location = resp.code, resp.body, resp.location
-	out.retryAfter = resp.retryAfter
 	out.status, out.retryable = interpret(resp.code, resp.body)
 
 	switch out.status {
@@ -1882,7 +1917,7 @@ func fatalf(format string, args ...any) {
 //
 // Names already removed because they were found available are not resurrected -
 // they are gone from the file too, so a re-read simply does not contain them.
-func watchList(ctx context.Context, cfg *config, wl *worklist) {
+func watchList(ctx context.Context, cfg *config, wl *worklist, ours *fileStamp) {
 	const every = 5 * time.Second
 	t := time.NewTicker(every)
 	defer t.Stop()
@@ -1914,6 +1949,15 @@ func watchList(ctx context.Context, cfg *config, wl *worklist) {
 			continue
 		}
 		lastMod, lastSize = st.ModTime(), st.Size()
+
+		// The tool prunes found names out of this file itself. That is a write
+		// like any other as far as the filesystem is concerned, so without this
+		// every prune reads as an edit and costs a full re-parse plus a rebuild
+		// of the work list - to rediscover that the names it dropped are the
+		// ones already retired.
+		if ours.isOurs(st.ModTime(), st.Size()) {
+			continue
+		}
 
 		names, err := loadLines(cfg.usernamesFile)
 		if err != nil || len(names) == 0 {

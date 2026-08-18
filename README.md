@@ -304,6 +304,14 @@ residential pools. `-per-proxy 0` removes the limit. But the honest answer to
 wanting more throughput from a fixed pool is **more proxies**, not more threads
 through the same ones.
 
+One caveat, and the panel now says it: the ceiling is enforced by the adaptive
+limiter, so `-no-adapt` switches it off along with everything else. Under
+`-no-adapt` the panel reads:
+
+```
+  Capacity : 10 per proxy - NOT enforced, -no-adapt drives all 2089 threads regardless
+```
+
 ## Notifications
 
 `-webhook` posts to any endpoint that accepts a Discord-shaped `{"content": …}`
