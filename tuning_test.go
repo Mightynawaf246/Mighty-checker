@@ -254,29 +254,41 @@ func TestBackoffFor(t *testing.T) {
 	}
 }
 
-// Recovery from the floor must be fast. Climbing one step at a time from 1 back
-// to a high ceiling would take longer than the run itself, which is what made a
-// throttled run stay slow forever.
-func TestAdaptiveLimiterRecoversQuicklyFromTheFloor(t *testing.T) {
+// Recovery from a bad patch must be fast up to the level that last worked, and
+// careful beyond it. Climbing one step at a time all the way back would take
+// longer than the run; charging past the known edge would just get cut again.
+func TestAdaptiveLimiterRecoversToTheKnownEdgeQuickly(t *testing.T) {
 	lim := newAdaptiveLimiter(500, true)
-	throttleNow(lim, 100)
-	if got, want := lim.current(), 500/minFloorDivisor; got != want {
-		t.Fatalf("setup: want the floor %d, got %d", want, got)
+	throttleNow(lim, 40)
+
+	low := lim.current()
+	lim.mu.Lock()
+	edge := lim.ssthresh
+	lim.mu.Unlock()
+
+	if float64(low) >= edge {
+		t.Fatalf("sustained throttling left no room to recover: cap %d, edge %.0f", low, edge)
 	}
 
-	// Feed clean answers and count how many it takes to get back to half the
-	// ceiling. Geometric growth needs a few hundred; one-step growth would need
-	// hundreds of thousands.
 	n := 0
-	for lim.current() < 250 && n < 20000 {
+	for float64(lim.current()) < edge && n < 20000 {
 		lim.onClean()
 		n++
 	}
-	if lim.current() < 250 {
-		t.Fatalf("never recovered: cap %d after %d clean answers", lim.current(), n)
+	if float64(lim.current()) < edge {
+		t.Fatalf("never recovered: cap %d, edge %.0f after %d clean answers", lim.current(), edge, n)
 	}
-	if n > 2000 {
-		t.Errorf("recovery took %d clean answers, far too slow", n)
+	if n > 500 {
+		t.Errorf("recovery to the known edge took %d clean answers, far too slow", n)
+	}
+
+	// Past the edge it must creep, one step per streak.
+	before := lim.current()
+	for i := 0; i < cleanStreakForGrowth; i++ {
+		lim.onClean()
+	}
+	if got := lim.current(); got != before+1 {
+		t.Errorf("beyond the known edge growth must be +1: %d -> %d", before, got)
 	}
 }
 
@@ -346,5 +358,80 @@ func TestRateWindowEdgeCases(t *testing.T) {
 	}
 	if got := w.add(now.Add(3*time.Second), 500); got != 0 {
 		t.Errorf("idle counter: want 0, got %d", got)
+	}
+}
+
+// The pause after a throttle must be short and must NOT be the same for every
+// worker. Without jitter, everyone throttled in the same instant waits the same
+// length of time and fires again together - a lockstep that turned a steady
+// rate into alternating bursts and dead air.
+func TestRetryPauseIsShortAndJittered(t *testing.T) {
+	seen := map[time.Duration]int{}
+	for i := 0; i < 400; i++ {
+		d := retryPause(0)
+		if d <= 0 || d > time.Second {
+			t.Fatalf("pause %v is outside a sane range", d)
+		}
+		seen[d]++
+	}
+	if len(seen) < 50 {
+		t.Errorf("only %d distinct pauses in 400 draws - not jittered", len(seen))
+	}
+
+	// It grows with the attempt, but stays capped.
+	if retryPause(1) == retryPause(1) && retryPause(5) > 2*time.Second {
+		t.Error("the pause is not capped")
+	}
+	for i := 0; i < 200; i++ {
+		if d := retryPause(9); d > 2*time.Second {
+			t.Fatalf("attempt 9 waited %v; the cap is not holding", d)
+		}
+	}
+}
+
+// The cap must slow down as it approaches the level that last drew a throttle,
+// instead of leaping past it and being cut again. Splitting "fast" from
+// "careful" at half the thread count - a number unrelated to where throttling
+// starts - made the cap oscillate instead of settling.
+func TestAdaptiveLimiterSlowsNearTheKnownEdge(t *testing.T) {
+	lim := newAdaptiveLimiter(1000, true)
+
+	// A throttle at 1000 records the edge and cuts to 700.
+	lim.onThrottle()
+	edge := lim.current()
+	if edge != 700 {
+		t.Fatalf("after one cut: got %d, want 700", edge)
+	}
+
+	// Growth from here must creep, not leap: at 700 with the edge at 700, a
+	// geometric step would jump to 1050.
+	for i := 0; i < cleanStreakForGrowth; i++ {
+		lim.onClean()
+	}
+	if got := lim.current(); got != 701 {
+		t.Errorf("near the edge the cap must creep: 700 -> %d, want 701", got)
+	}
+
+	// Driven well under the edge by sustained throttling, it must still climb
+	// fast - and never overshoot the edge in a single step.
+	lim2 := newAdaptiveLimiter(1000, true)
+	throttleNow(lim2, 8)
+	low := lim2.current()
+	lim2.mu.Lock()
+	ss := lim2.ssthresh
+	lim2.mu.Unlock()
+	if float64(low) >= ss {
+		t.Fatalf("sustained throttling left no gap to recover through: cap %d, edge %.0f", low, ss)
+	}
+
+	for i := 0; i < cleanStreakForGrowth; i++ {
+		lim2.onClean()
+	}
+	grown := lim2.current()
+	if grown <= low+1 {
+		t.Errorf("recovery below the edge should be geometric, %d -> %d", low, grown)
+	}
+	if float64(grown) > ss+1 {
+		t.Errorf("a single step (%d) jumped past the known edge (%.0f)", grown, ss)
 	}
 }

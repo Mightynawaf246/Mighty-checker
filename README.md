@@ -140,6 +140,45 @@ That needs no username list, so it works before your list is even ready.
 | `-prune-proxies` | delete the proxies that were tested and failed (comments kept; anything not tested is left alone) |
 | `-no-proxy-check` | skip the pre-flight |
 
+Every proxy is then listed with its own numbers, fastest first, and the full
+list is written to `proxies-ping.txt` so a thousand-proxy report stays readable:
+
+```
+ [ Every proxy ]  ping = reaching it; total = ping + Instagram answering
+  +     41ms  http://1.2.3.4:8080                    total 168ms
+  +     44ms  socks5h://5.6.7.8:1080                 total 171ms
+  +    310ms  http://user:***@9.9.9.9:3128           total 437ms
+  x        -  http://11.11.11.11:8080                proxy unreachable (dead proxy)
+```
+
+## Keeping the rate steady
+
+A rate that swings between bursts and dead air is not a slow endpoint, it is a
+run moving in lockstep. Two things caused it, and both are fixed:
+
+**Everyone waited the same length of time.** A throttled worker used to honour
+`Retry-After` literally, so every worker throttled in the same instant slept for
+exactly the same duration and fired again in the same instant — throttling each
+other, and sleeping together again. The pause is now short and jittered, because
+a throttle is aimed at one IP and there is a whole pool of them: the remedy is
+the next proxy, not the clock. Global back-pressure is the limiter's job and it
+has already been told.
+
+**The cap leapt past its own limit.** Growth switched from fast to careful at
+half the requested thread count — a number with no relationship to where
+throttling actually starts. With `-t 1000` against an endpoint saturating near
+300, the cap jumped 512 → 768 in one step, overshot, got cut, and oscillated
+there forever. It now remembers the level that last drew a throttle and creeps
+once it is near it, recovering fast only while it is well below.
+
+Measured against an endpoint that throttles above its capacity, sampling every
+250ms:
+
+| | before | after |
+|---|--------|-------|
+| rate | swinging 0 → 9 260 → 0 → 864 | steady 12 556 – 14 464 |
+| variation | the full range, including dead air | **3% of the mean** |
+
 ## Continuous checking (no rounds)
 
 A run is one uninterrupted stream. Workers take the next free name, check it,

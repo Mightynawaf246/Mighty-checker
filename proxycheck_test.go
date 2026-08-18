@@ -263,3 +263,59 @@ func TestLatencySplitAttribution(t *testing.T) {
 		t.Errorf("the parts (%v + %v) exceed the whole (%v)", rep.connect, rep.serve, rep.rtt)
 	}
 }
+
+// The per-proxy file is the answer to "what is the ping of the proxies I put
+// in", so it has to name every one of them with its own number.
+func TestPingReportListsEveryProxy(t *testing.T) {
+	spec := func(u string) *proxySpec {
+		s, err := parseProxy(u)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return s
+	}
+	reports := []proxyReport{
+		{spec: spec("http://1.1.1.1:8080"), tested: true, ok: true,
+			connect: 40 * time.Millisecond, rtt: 160 * time.Millisecond},
+		{spec: spec("socks5://2.2.2.2:1080"), tested: true, ok: true,
+			connect: 90 * time.Millisecond, rtt: 210 * time.Millisecond},
+		{spec: spec("http://user:secret@3.3.3.3:8080"), tested: true, ok: false,
+			reason: "proxy auth failed (wrong user/pass)"},
+	}
+
+	path := filepath.Join(t.TempDir(), "proxies-ping.txt")
+	if err := writePingReport(path, reports); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(raw)
+
+	for _, want := range []string{"1.1.1.1", "2.2.2.2", "3.3.3.3", "40ms", "90ms", "160ms", "210ms"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("report is missing %q:\n%s", want, got)
+		}
+	}
+	if !strings.Contains(got, "proxy auth failed") {
+		t.Errorf("the failure reason is missing:\n%s", got)
+	}
+	// Credentials must not reach a file the user will paste somewhere.
+	if strings.Contains(got, "secret") {
+		t.Errorf("the password leaked into the report:\n%s", got)
+	}
+}
+
+// ping falls back to the whole round trip when the phase timing is unavailable,
+// so a row never shows a blank.
+func TestPingFallsBackToTotal(t *testing.T) {
+	r := proxyReport{tested: true, ok: true, rtt: 120 * time.Millisecond}
+	if got := r.ping(); got != 120*time.Millisecond {
+		t.Errorf("ping = %v, want the round trip", got)
+	}
+	r.connect = 30 * time.Millisecond
+	if got := r.ping(); got != 30*time.Millisecond {
+		t.Errorf("ping = %v, want the connect phase", got)
+	}
+}

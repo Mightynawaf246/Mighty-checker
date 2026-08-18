@@ -605,19 +605,24 @@ func TestBestExcludesQuarantinedProxies(t *testing.T) {
 
 // ------------------------------------------------------------------- limiter
 
-// Additive increase near the ceiling: replacing the +1 step with unconditional
-// geometric growth must fail this.
-func TestAdaptiveLimiterCreepsNearTheCeiling(t *testing.T) {
+// With no throttle ever seen there is no known edge, so nothing justifies
+// creeping: the cap should return to what the user asked for quickly.
+func TestAdaptiveLimiterClimbsFreelyWithNoKnownEdge(t *testing.T) {
 	lim := newAdaptiveLimiter(100, true)
 	lim.mu.Lock()
-	lim.limit = 80 // above max/2, so growth must be additive
+	lim.limit = 10
 	lim.mu.Unlock()
 
-	for i := 0; i < cleanStreakForGrowth; i++ {
+	answers := 0
+	for lim.current() < 100 && answers < 5000 {
 		lim.onClean()
+		answers++
 	}
-	if got := lim.current(); got != 81 {
-		t.Errorf("near the ceiling growth must be +1: 80 -> %d", got)
+	if lim.current() < 100 {
+		t.Fatalf("never reached the requested cap: %d after %d answers", lim.current(), answers)
+	}
+	if answers > 200 {
+		t.Errorf("took %d clean answers to climb 10 -> 100 with nothing throttling", answers)
 	}
 }
 

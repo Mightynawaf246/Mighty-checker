@@ -323,18 +323,104 @@ func printProxyReport(cfg *config, reports []proxyReport) (alive int) {
 		}
 	}
 
-	// Name the dead ones, but only while the list is short enough to read.
-	if len(dead) > 0 && len(dead) <= 20 {
-		fmt.Println()
-		for _, r := range dead {
-			fmt.Printf("  %s %s  %s\n", cRed("x"), cWhite(r.spec.String()), cGray(r.reason))
+	printPerProxy(cfg, reports)
+	return alive
+}
+
+// printPerProxy lists what every single proxy did, because an aggregate hides
+// the thing the user usually wants: which of MY proxies is fast, and which one
+// is the problem.
+//
+// Ping is the connect half - reaching the proxy and the proxy reaching
+// Instagram's edge. That is the part a different proxy can change. Total adds
+// Instagram's own answering time, which is the same wherever you buy from.
+func printPerProxy(cfg *config, reports []proxyReport) {
+	var tested []proxyReport
+	for _, r := range reports {
+		if r.tested {
+			tested = append(tested, r)
 		}
-	} else if len(dead) > 20 {
-		fmt.Println()
-		fmt.Println("  " + cGray(fmt.Sprintf("(%d dead proxies - use -prune-proxies to remove them)", len(dead))))
+	}
+	if len(tested) == 0 {
+		return
 	}
 
-	return alive
+	// Fastest first, dead ones last.
+	sort.Slice(tested, func(i, j int) bool {
+		a, b := tested[i], tested[j]
+		if a.ok != b.ok {
+			return a.ok
+		}
+		if !a.ok {
+			return false
+		}
+		return a.ping() < b.ping()
+	})
+
+	line := func(r proxyReport) string {
+		if !r.ok {
+			return fmt.Sprintf("  %s %8s  %-42s %s",
+				cRed("x"), cGray("-"), cWhite(r.spec.String()), cGray(r.reason))
+		}
+		return fmt.Sprintf("  %s %8s  %-42s %s",
+			cGreen("+"),
+			cCyan(r.ping().Round(time.Millisecond).String()),
+			cWhite(r.spec.String()),
+			cGray("total "+r.rtt.Round(time.Millisecond).String()))
+	}
+
+	fmt.Println()
+	fmt.Println(" " + label("Every proxy") + " " + cGray("ping = reaching it; total = ping + Instagram answering"))
+
+	const inline = 30
+	if len(tested) <= inline {
+		for _, r := range tested {
+			fmt.Println(line(r))
+		}
+	} else {
+		// Too many to read: show the extremes, which is what a decision needs.
+		for _, r := range tested[:10] {
+			fmt.Println(line(r))
+		}
+		fmt.Println("  " + cGray(fmt.Sprintf("... %d more ...", len(tested)-15)))
+		for _, r := range tested[len(tested)-5:] {
+			fmt.Println(line(r))
+		}
+	}
+
+	// The full list always goes to a file, so a thousand-proxy report is
+	// readable even when the terminal is not.
+	path := outPath(cfg, "proxies-ping.txt")
+	if err := writePingReport(path, tested); err != nil {
+		warnf("cannot write %s: %v", path, err)
+		return
+	}
+	fmt.Println("  " + cGray("full list -> ") + cWhite(path))
+}
+
+// ping is the part of the round trip a different proxy could change.
+func (r proxyReport) ping() time.Duration {
+	if r.connect > 0 {
+		return r.connect
+	}
+	return r.rtt
+}
+
+func writePingReport(path string, reports []proxyReport) error {
+	var b strings.Builder
+	b.WriteString("# ping = reaching the proxy and it reaching Instagram (what a different proxy changes)\n")
+	b.WriteString("# total = ping + Instagram's own answering time (the same wherever you buy from)\n")
+	b.WriteString("#\n")
+	b.WriteString("# status     ping     total  proxy\n")
+	for _, r := range reports {
+		if r.ok {
+			fmt.Fprintf(&b, "ok      %9s %9s  %s\n",
+				r.ping().Round(time.Millisecond), r.rtt.Round(time.Millisecond), r.spec)
+		} else {
+			fmt.Fprintf(&b, "dead    %9s %9s  %s   %s\n", "-", "-", r.spec, r.reason)
+		}
+	}
+	return os.WriteFile(path, []byte(b.String()), 0o644)
 }
 
 func pctl(sorted []time.Duration, p int) time.Duration {

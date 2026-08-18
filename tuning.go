@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"math"
+	"math/rand/v2"
 	"sync"
 	"time"
 )
@@ -50,6 +51,18 @@ type adaptiveLimiter struct {
 	lastCut  time.Time // when the cap was last cut
 	lastGrow time.Time // when the cap was last widened
 
+	// ssthresh is the cap at which throttling was last seen. Below it the run
+	// is recovering and can climb fast; at or above it the run is probing the
+	// edge and must creep.
+	//
+	// Without it, "fast" and "careful" were split at half the requested thread
+	// count, a number with no relationship to where throttling actually starts.
+	// With -t 1000 against an endpoint that saturates near 300, the cap jumped
+	// 512 -> 768 in a single step, overshot, got cut, and oscillated there
+	// forever instead of settling.
+	ssthresh  float64
+	edgeKnown bool // has a throttle ever been seen?
+
 	waiters int  // goroutines currently parked in acquire
 	poking  bool // is the safety-net broadcaster running?
 
@@ -90,10 +103,11 @@ func newAdaptiveLimiter(threads int, enabled bool) *adaptiveLimiter {
 	}
 	floor := math.Max(1, math.Floor(float64(threads)/minFloorDivisor))
 	l := &adaptiveLimiter{
-		limit:   float64(threads),
-		min:     floor,
-		max:     float64(threads),
-		enabled: enabled,
+		limit:    float64(threads),
+		min:      floor,
+		max:      float64(threads),
+		ssthresh: float64(threads),
+		enabled:  enabled,
 	}
 	l.cond = sync.NewCond(&l.mu)
 	return l
@@ -191,13 +205,17 @@ func (l *adaptiveLimiter) growLocked() {
 	if l.limit >= l.max {
 		return
 	}
-	// Well below the ceiling, recovery is what matters, so grow geometrically:
-	// climbing from the floor back to 500 one step at a time would take the rest
-	// of the run. Near the ceiling, creep by one instead, so the cap settles on
-	// the sustainable rate rather than overshooting and being cut again.
+	// Recovering from a hole, climb geometrically: coming back from the floor
+	// one step at a time would take the rest of the run. Near the level that
+	// last drew a throttle, creep by one instead, so the cap settles on the
+	// sustainable rate rather than overshooting and being cut again.
 	step := 1.0
-	if l.limit < l.max/2 {
+	if l.limit < l.ssthresh {
 		step = l.limit * 0.5
+		// Never jump so far that the step itself overshoots the known edge.
+		if l.limit+step > l.ssthresh {
+			step = l.ssthresh - l.limit
+		}
 	}
 	l.limit = math.Min(l.max, l.limit+step)
 	l.lastGrow = time.Now()
@@ -245,6 +263,26 @@ func (l *adaptiveLimiter) onThrottle() {
 	if next < l.min {
 		next = l.min
 	}
+	// Remember where the edge is, so the climb back slows as it nears it.
+	//
+	// The edge decays more slowly than the cap does. Pinning it to the cap on
+	// every throttle makes the two equal forever, which leaves the run creeping
+	// back one step at a time even from the floor - the very problem geometric
+	// recovery exists to solve. Letting the cap fall faster opens a gap that
+	// recovery can climb through quickly, while the last few steps before the
+	// known edge stay careful.
+	switch {
+	case !l.edgeKnown:
+		// The first throttle is the first real information about where the
+		// edge is. Take it at face value.
+		l.ssthresh = next
+		l.edgeKnown = true
+	case next > l.ssthresh:
+		l.ssthresh = next
+	default:
+		l.ssthresh = l.ssthresh*0.95 + next*0.05
+	}
+
 	if next < l.limit {
 		l.limit = next
 		l.decreases++
@@ -338,4 +376,21 @@ func (w *rateWindow) add(now time.Time, value float64) int {
 		return 0
 	}
 	return int(rate)
+}
+
+// retryPause is how long a worker waits before retrying a throttled check on a
+// different proxy.
+//
+// Short, because a throttle is aimed at one IP and the pool has others; the
+// remedy is the next proxy, not the clock. Jittered, because without it every
+// worker throttled in the same instant waits the same length of time and fires
+// again in the same instant - a lockstep that turns a steady rate into
+// alternating bursts and dead air.
+func retryPause(attempt int) time.Duration {
+	base := 80 * time.Millisecond << attempt
+	if base > 800*time.Millisecond {
+		base = 800 * time.Millisecond
+	}
+	// Spread over [0.5x, 1.5x).
+	return base/2 + time.Duration(rand.Int64N(int64(base)))
 }

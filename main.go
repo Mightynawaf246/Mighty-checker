@@ -957,15 +957,21 @@ func checkWithRetries(ctx context.Context, username string, pool *proxyPool,
 			return outcomeResult(username, out, cfg)
 		}
 
-		// Unknown or throttled. Back off if the server asked us to, then retry
-		// on a different proxy.
+		// Unknown or throttled. Pause briefly, then retry on a different proxy.
+		//
+		// The pause is short and jittered on purpose. A throttle is nearly
+		// always aimed at one IP, and there is a whole pool of them, so the
+		// real remedy is the next proxy rather than waiting. Honouring a
+		// Retry-After literally is worse than useless here: every worker
+		// throttled in the same instant then sleeps for exactly the same
+		// duration and wakes in the same instant, throttling each other again.
+		// Measured against an endpoint that throttles above its capacity, that
+		// lockstep swung the rate between zero and nine thousand per second in
+		// alternating bursts. Global back-pressure is the limiter's job, and it
+		// has already been told.
 		if out.retryable && attempt < attempts-1 {
-			// Exponential base, overridden by Retry-After when the server sent
-			// one, and capped so a hostile header cannot stall the run.
-			base := 300 * time.Millisecond << attempt
-			wait := backoffFor(out.retryAfter, base, 5*time.Second)
 			select {
-			case <-time.After(wait):
+			case <-time.After(retryPause(attempt)):
 			case <-ctx.Done():
 				return outcomeResult(username, out, cfg)
 			}
