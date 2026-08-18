@@ -193,16 +193,28 @@ func TestRandomHelpersProduceCorrectShape(t *testing.T) {
 	if got := len(randomString(20)); got != 20 {
 		t.Errorf("randomString(20) length = %d", got)
 	}
-	h := fastHex(12)
-	if len(h) != 12 {
-		t.Errorf("fastHex(12) length = %d", len(h))
+	// The device id is UUID-shaped and uppercase hex, which is what the real
+	// client sends.
+	id := randomDeviceID()
+	if len(id) != 36 {
+		t.Errorf("randomDeviceID length = %d, want 36", len(id))
 	}
-	for _, r := range h {
-		if !strings.ContainsRune("0123456789abcdef", r) {
-			t.Errorf("fastHex produced non-hex rune %q", r)
+	for i, r := range id {
+		switch i {
+		case 8, 13, 18, 23:
+			if r != '-' {
+				t.Errorf("position %d = %q, want a dash", i, r)
+			}
+		default:
+			if !strings.ContainsRune("0123456789ABCDEF", r) {
+				t.Errorf("randomDeviceID produced non-uppercase-hex rune %q", r)
+			}
 		}
 	}
-	if randomString(0) != "" || fastHex(0) != "" {
-		t.Error("zero-length helpers should return empty strings")
+	if randomDeviceID() == randomDeviceID() {
+		t.Error("randomDeviceID repeated itself")
+	}
+	if randomString(0) != "" {
+		t.Error("zero-length randomString should return an empty string")
 	}
 }

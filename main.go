@@ -45,6 +45,10 @@ type config struct {
 	noConfirm     bool
 	noAdapt       bool
 	http2         bool
+
+	noProxyCheck     bool
+	checkProxiesOnly bool
+	pruneProxies     bool
 }
 
 // liveStats holds counters written by workers and read by the status line, so
@@ -325,6 +329,34 @@ func main() {
 	cache := newClientCacheFor(cfg.timeout, cfg.threads).withHTTP2(cfg.http2)
 	defer cache.closeIdle()
 
+	// Test the proxies before checking a single username. A proxy list is the
+	// one input that cannot be validated by reading it: a line that parses
+	// perfectly can still be expired or pointed at a host that stopped
+	// answering. Finding that out here, with the reason stated, beats a slow
+	// run full of unexplained errors.
+	if pool.len() > 0 && !cfg.noProxyCheck {
+		reports := checkProxies(ctx, pool, cache, cfg, newConsole(cfg))
+		alive := printProxyReport(cfg, reports)
+
+		if cfg.pruneProxies {
+			kept, err := pruneProxies(cfg.proxiesFile, reports)
+			if err != nil {
+				warnf("cannot prune %s: %v", cfg.proxiesFile, err)
+			} else {
+				fmt.Println("  " + cGreen(fmt.Sprintf("pruned %s - %d working proxies kept",
+					cfg.proxiesFile, kept)))
+			}
+		}
+		if alive == 0 {
+			fatalf("no working proxies - fix the list above, or run with -no-proxy to connect directly")
+		}
+		if cfg.checkProxiesOnly {
+			return
+		}
+		fmt.Println()
+		fmt.Println(" " + label("Logs"))
+	}
+
 	// One limiter for the whole run, so what it learns about the endpoint's
 	// tolerance is never thrown away.
 	lim := newAdaptiveLimiter(cfg.threads, !cfg.noAdapt)
@@ -522,8 +554,11 @@ func printConfig(cfg *config, usernames []string, pool *proxyPool) {
 		row("Endpoint", cGray(graphqlURL))
 		row("doc_id", cGray(docID))
 	}
-	fmt.Println()
-	fmt.Println(" " + label("Logs"))
+	if pool.len() == 0 || cfg.noProxyCheck {
+		// With a proxy check coming, the Logs header is printed after it.
+		fmt.Println()
+		fmt.Println(" " + label("Logs"))
+	}
 }
 
 // printSummary prints the final summary panel.
@@ -1471,6 +1506,12 @@ func parseFlags() *config {
 		"disable adaptive concurrency and drive all threads flat out")
 	flag.BoolVar(&cfg.http2, "http2", false,
 		"use HTTP/2 (one connection per host, much lower concurrency)")
+	flag.BoolVar(&cfg.noProxyCheck, "no-proxy-check", false,
+		"skip testing the proxies before the run")
+	flag.BoolVar(&cfg.checkProxiesOnly, "check-proxies", false,
+		"test the proxies, print the report, and exit")
+	flag.BoolVar(&cfg.pruneProxies, "prune-proxies", false,
+		"remove proxies that failed the test from the proxies file")
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, `Mighty - Instagram username availability checker
@@ -1495,6 +1536,9 @@ options:
   -no-confirm           report available names without a confirming re-check
   -no-adapt             disable adaptive concurrency (drive threads flat out)
   -http2                use HTTP/2 (one connection per host, far less parallel)
+  -check-proxies        test the proxies, print the report, and exit
+  -prune-proxies        remove failed proxies from the proxies file
+  -no-proxy-check       skip the pre-flight proxy test
   -update               check for a new version and update in place
   -version              print the version and exit
   -no-update-check      skip the startup update check

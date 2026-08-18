@@ -84,6 +84,46 @@ Passing any flag (for example `-t 50`) skips the menu and starts immediately,
 so scripting still works. `-no-prompt` disables the menu entirely, and `-menu`
 forces it even when flags are present.
 
+## Proxy check (runs automatically)
+
+A proxy list is the one input the tool cannot validate by reading it: a line
+that parses perfectly can still be expired, rate-limited, or pointed at a host
+that stopped answering months ago. So before the first username is checked,
+every proxy gets one real request through it and the result is reported:
+
+```
+ [ Proxy Check ]
+  Tested   : 500
+  Alive    : 431 (86%)
+  Dead     : 69
+  Latency  : p50 180ms   p90 420ms   p99 1.2s
+  Expect   : ~2778 req/sec at -t 500
+  For 5k   : -t 900, or proxies faster than 100ms
+  For 10k  : -t 1800, or proxies faster than 50ms
+
+ [ Why proxies failed ]
+  41     proxy unreachable (dead proxy)
+  19     proxy auth failed (wrong user/pass)
+  9      rate limited (HTTP 429)
+```
+
+Three things come out of this:
+
+- **You find out immediately**, with a cause per proxy, instead of watching a
+  slow run full of unexplained errors. Passwords are masked in every line.
+- **The measured latency predicts your rate.** Throughput is
+  `concurrency / latency`, and this is the first moment both numbers are known,
+  so the tool does the arithmetic and tells you the `-t` your target needs.
+- **The run starts calibrated.** Every measurement is fed into the pool, so the
+  slow-proxy steering works from the first request instead of having to learn
+  it, and dead proxies are already quarantined.
+
+| Flag | Effect |
+|------|--------|
+| `-check-proxies` | run the test, print the report, exit |
+| `-prune-proxies` | delete the failed proxies from `proxies.txt` (comments kept) |
+| `-no-proxy-check` | skip the pre-flight |
+
 ## Continuous checking (no rounds)
 
 A run is one uninterrupted stream. Workers take the next free name, check it,
@@ -298,6 +338,7 @@ name there spends a request to learn nothing, so a list shorter than `-t` leaves
 threads idle, and the tool says so rather than pretending otherwise.
 
 **2. Less latency.** The other half of the equation, and mostly your proxy list.
+The proxy check above measures it and tells you the `-t` your target needs.
 Two settings matter here:
 
 - **`-timeout`** — the default is `10s`, which means a hung proxy occupies a
@@ -305,6 +346,23 @@ Two settings matter here:
   `-timeout 4s` frees those workers more than twice as fast. Set it too low and
   healthy-but-slow proxies start failing, so watch `E` after changing it.
 - **`-retries 1`** (the default) — every extra attempt is another round trip.
+
+**Where it stops helping.** More threads only help while workers are waiting on
+the network. Once the CPU is saturated, extra goroutines cost more than they
+earn. Measured against a zero-latency local endpoint on 4 cores — the point at
+which the tool itself is the only limit:
+
+| threads | requests/sec |
+|---------|--------------|
+| 500 | 46 066 |
+| 1 000 | 40 381 |
+| 2 000 | 34 752 |
+
+So roughly 46 000/sec is what four cores can push, and past a certain point
+raising `-t` makes things slower rather than faster. With real proxies at 100ms
+the workers are idle almost all the time, so `-t 1000` reaches ~10 000/sec
+comfortably; the CPU ceiling only bites once latency gets very low or the thread
+count gets very high.
 
 Beyond that, more proxies is the only real answer: throughput is roughly
 `concurrency / latency`, so 500 workers against 300ms proxies is about 1 600

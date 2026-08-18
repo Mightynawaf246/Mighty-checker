@@ -20,3 +20,6 @@ errors.txt
 # The tool creates them from the .example templates on first run.
 username.txt
 proxies.txt
+
+# Test binaries from -cpuprofile runs
+*.test
