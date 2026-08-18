@@ -70,19 +70,24 @@ Run the tool with no flags and it shows a menu, then asks for settings:
 
 ```
  [ Mighty Menu ]
-  1  Start checking
-  2  Test my proxies        <- how many are alive, and how fast
-  3  Check for updates      <- the update button
-  4  Quit
+  1  Start checking          you choose the threads
+  2  Start at a target rate  you choose the requests/sec
+  3  Test my proxies         <- how many are alive, and how fast
+  4  Check for updates       <- the update button
+  5  Quit
 
-  choice: [1] 1
+  choice: [1] 2
 
-  Threads: [10] 500
-  Or aim for requests/sec (0 = use the threads above): [0] 5000
-  Always run at full threads (no auto-slowdown)? [y/N] n
+  Target requests per second: [5000] 5000
   Loop forever (keep re-checking)? [y/N] y
   Delay between requests: [0s] 0s
+
+  the proxy test will measure your latency and set the threads.
 ```
+
+Option **1** is the manual route: you give a thread count and it uses it.
+Option **2** is the one to reach a number — you name the rate, and the threads
+are worked out from the latency the proxy test measures.
 
 Passing any flag (for example `-t 50`) skips the menu and starts immediately,
 so scripting still works. `-no-prompt` disables the menu entirely, and `-menu`
@@ -162,8 +167,7 @@ argued with; concurrency is the one term you control. So the thread count that
 reaches a given rate is arithmetic, and the pre-flight has just measured the one
 unknown in it — no reason to do it by hand:
 
-From the menu, answer the *"Or aim for requests/sec"* question with your number.
-Or on the command line:
+From the menu, that is option **2**. Or on the command line:
 
 ```
 mighty.exe -target 5000 -loop

@@ -555,49 +555,75 @@ func printSpeedDiagnosis(cfg *config, counts tally, lim *adaptiveLimiter,
 func runInteractiveSetup(cfg *config) bool {
 	for {
 		fmt.Println(" " + label(appName+" Menu") + " " + cGray("v"+appVersion()))
-		fmt.Println("  " + cCyan("1") + cGray("  Start checking"))
-		fmt.Println("  " + cCyan("2") + cGray("  Test my proxies"))
-		fmt.Println("  " + cCyan("3") + cGray("  Check for updates"))
-		fmt.Println("  " + cCyan("4") + cGray("  Quit"))
+		item := func(n, title, note string) {
+			if note == "" {
+				fmt.Println("  " + cCyan(n) + cGray("  "+title))
+				return
+			}
+			fmt.Println("  " + cCyan(n) + cGray(fmt.Sprintf("  %-24s%s", title, note)))
+		}
+		item("1", "Start checking", "you choose the threads")
+		item("2", "Start at a target rate", "you choose the requests/sec")
+		item("3", "Test my proxies", "")
+		item("4", "Check for updates", "")
+		item("5", "Quit", "")
 		fmt.Println()
 
 		switch ask("choice:", "1") {
 		case "1":
 			fmt.Println()
+			cfg.targetRPS = 0
 			cfg.threads = askInt("Threads:", cfg.threads)
-			// Offered here because working the thread count out from a latency
-			// percentile is arithmetic the tool can do, and because the menu is
-			// how this gets driven - a flag nobody sees is a flag nobody uses.
-			cfg.targetRPS = askInt("Or aim for requests/sec (0 = use the threads above):",
-				cfg.targetRPS)
-			// Offered here because it is the one setting that decides whether
-			// the thread count you just typed is a target or merely a ceiling.
+			// Asked here because it is the one setting that decides whether the
+			// thread count just typed is a target or merely a ceiling.
 			cfg.noAdapt = askBool("Always run at full threads (no auto-slowdown)?", cfg.noAdapt)
-			cfg.loop = askBool("Loop forever (keep re-checking)?", cfg.loop)
-			if cfg.loop {
-				cfg.delay = askDuration("Delay between requests:", cfg.delay)
-			}
-			fmt.Println()
+			askRunOptions(cfg)
 			return true
 
 		case "2":
+			// Name the rate and let the tool work out the threads. Throughput is
+			// concurrency over latency; the proxy test measures the latency, so
+			// the thread count is arithmetic rather than something to guess at.
+			fmt.Println()
+			target := cfg.targetRPS
+			if target == 0 {
+				target = 5000
+			}
+			cfg.targetRPS = askInt("Target requests per second:", target)
+			// Adaptation stays on: a rate is a destination, and driving flat out
+			// past what the endpoint accepts is what makes a rate unsteady.
+			cfg.noAdapt = false
+			askRunOptions(cfg)
+			fmt.Println("  " + cGray("the proxy test will measure your latency and set the threads."))
+			return true
+
+		case "3":
 			// Test the proxies and stop there, so the report can be read
 			// without a run starting underneath it.
 			cfg.checkProxiesOnly = true
 			fmt.Println()
 			return true
 
-		case "3":
+		case "4":
 			runUpdateCommand()
 			fmt.Println()
 
-		case "4", "q", "quit", "exit":
+		case "5", "q", "quit", "exit":
 			return false
 
 		default:
-			fmt.Println("  " + cRed("pick 1, 2, 3 or 4"))
+			fmt.Println("  " + cRed("pick a number from 1 to 5"))
 		}
 	}
+}
+
+// askRunOptions asks the questions both start modes share.
+func askRunOptions(cfg *config) {
+	cfg.loop = askBool("Loop forever (keep re-checking)?", cfg.loop)
+	if cfg.loop {
+		cfg.delay = askDuration("Delay between requests:", cfg.delay)
+	}
+	fmt.Println()
 }
 
 // askDuration asks for a Go-style duration such as 200ms or 2s.
@@ -625,13 +651,23 @@ func printConfig(cfg *config, usernames []string, pool *proxyPool) {
 
 	fmt.Println(" " + label(appName+" Checker") + " " + cGray("v"+appVersion()))
 	row("Target", cWhite(fmt.Sprintf("%s (%d names)", cfg.usernamesFile, len(usernames))))
-	row("Threads", cCyan(fmt.Sprintf("%d", cfg.threads)))
+	if cfg.targetRPS > 0 {
+		// Printing the current thread count here would be a lie: the whole
+		// point of a target is that the number is worked out from the latency
+		// the proxy test is about to measure.
+		// Not called "Target": that label already belongs to the username file
+		// two lines up, and two rows with the same name is worse than none.
+		row("Rate", cCyan(fmt.Sprintf("%d req/sec - threads set after the proxy test",
+			cfg.targetRPS)))
+	} else {
+		row("Threads", cCyan(fmt.Sprintf("%d", cfg.threads)))
+	}
 
 	// In a single pass a name is checked once, so a list shorter than the thread
 	// count leaves threads with nothing to do. While looping there is always
 	// more work - the list comes round again - so every thread is used and each
 	// name is simply checked more often.
-	if n := len(usernames); n > 0 && n < cfg.threads {
+	if n := len(usernames); n > 0 && n < cfg.threads && cfg.targetRPS == 0 {
 		if cfg.loop {
 			per := cfg.threads / n
 			row("Watch", cCyan(fmt.Sprintf("%d names across %d threads (~%dx in flight each)",
@@ -652,9 +688,12 @@ func printConfig(cfg *config, usernames []string, pool *proxyPool) {
 	} else {
 		row("Confirm", cGreen("on (available re-checked on another proxy)"))
 	}
-	if cfg.noAdapt {
+	switch {
+	case cfg.noAdapt:
 		row("Adaptive", cYellow(fmt.Sprintf("off (all %d threads flat out)", cfg.threads)))
-	} else {
+	case cfg.targetRPS > 0:
+		row("Adaptive", cGreen("on (tuned to the endpoint)"))
+	default:
 		row("Adaptive", cGreen(fmt.Sprintf("on (up to %d, tuned to the endpoint)", cfg.threads)))
 	}
 	if cfg.http2 {
@@ -1680,8 +1719,10 @@ options:
   -no-prompt            never show the interactive menu
   -quiet                suppress all console output
 
-Run with no flags on a terminal to get the interactive menu
-(start / test proxies / check for updates / quit) and be asked for threads.
+Run with no flags on a terminal to get the interactive menu:
+  1 start with a thread count you choose
+  2 start at a target requests/sec, threads worked out from your proxies
+  3 test my proxies    4 check for updates    5 quit
 If the menu does not appear, run with -menu to force it.
 
 proxy formats (all supported, scheme defaults to http):
