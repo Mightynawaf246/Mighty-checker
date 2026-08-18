@@ -148,6 +148,7 @@ That needs no username list, so it works before your list is even ready.
 | `-prune-proxies` | delete the proxies that were tested and failed (comments kept; anything not tested is left alone) |
 | `-no-proxy-check` | skip the pre-flight |
 | `-target N` | aim for N requests/sec — sets `-t` from the measured latency |
+| `-per-proxy N` | max requests in flight through one proxy (default 10, `0` = no limit) |
 
 Every proxy is then listed with its own numbers, fastest first, and the full
 list is written to `proxies-ping.txt` so a thousand-proxy report stays readable:
@@ -195,6 +196,46 @@ goroutines cost more than they earn — at that latency, faster proxies are the
 only way. It also warns when the thread count works out to more than ~25 per
 working proxy, since spreading a small pool that thin gets every member of it
 throttled.
+
+## Proxy capacity: why more threads can make it slower
+
+A proxy is a machine with a connection limit of its own. Past it, requests do
+not fail — they **queue**. So overloading a pool shows up as latency rather than
+as errors, and the natural reaction (add threads) makes it worse.
+
+This is the most common cause of a rate that starts high and sags. From a real
+run:
+
+```
+CUS 2089 | LAT 3.037s | PX 58/100
+```
+
+2 089 checks in flight over 100 proxies, of which 58 were still healthy, is
+**36 requests queued on every working proxy**. Round trips stretched to three
+seconds, and `2089 / 3.0` is about 700 requests a second — from a configuration
+asking for far more.
+
+So the concurrency cap is now bounded by what the pool can actually carry:
+`healthy proxies x -per-proxy` (default 10). It moves as proxies are
+quarantined and recover. Measured at the *same* thread count against a pool that
+queues past ten:
+
+| | requests/sec | latency |
+|---|--------------|---------|
+| `-t 2089`, no capacity limit | 2 362 | 854ms |
+| `-t 2089`, capacity respected | **2 645** | **326ms** |
+
+Faster *and* two and a half times lower latency, from the same threads. The
+configuration panel states the arithmetic up front:
+
+```
+  Capacity : 10 in flight per proxy - 100 proxies carry 1000 at once, below -t 2089
+```
+
+Raise `-per-proxy` if your proxies are dedicated and can take more; lower it for
+residential pools. `-per-proxy 0` removes the limit. But the honest answer to
+wanting more throughput from a fixed pool is **more proxies**, not more threads
+through the same ones.
 
 ## Reading a rate that dropped
 

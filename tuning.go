@@ -42,8 +42,21 @@ type adaptiveLimiter struct {
 	cond *sync.Cond
 
 	limit    float64 // current concurrency cap
-	min, max float64
+	min, max float64 // max is the ceiling asked for with -t
 	inflight int
+
+	// ceiling is what the proxy pool can actually carry: healthy proxies times
+	// the per-proxy limit. It is the binding constraint far more often than -t.
+	//
+	// A proxy is a machine with its own connection limit, and past it requests
+	// do not fail, they queue - so the symptom is not an error but latency.
+	// Measured on a real run: 2089 concurrent checks over 100 proxies, of which
+	// 58 were healthy, is 36 in flight per proxy; round trips stretched to
+	// three seconds and the rate sat near 700/sec. The same concurrency spread
+	// over enough proxies answers in a fraction of that.
+	//
+	// Zero means unconstrained, for a direct connection.
+	ceiling float64
 
 	cleanSinceCut int  // clean answers since the last actual decrease
 	enabled       bool // false means "always allow", for -no-adapt
@@ -121,7 +134,7 @@ func (l *adaptiveLimiter) acquire(ctx context.Context) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	for float64(l.inflight) >= l.limit {
+	for float64(l.inflight) >= math.Min(l.limit, l.headroom()) {
 		if ctx.Err() != nil {
 			return false
 		}
@@ -202,7 +215,8 @@ func (l *adaptiveLimiter) onClean() {
 
 // growLocked widens the cap by one step. The caller holds the lock.
 func (l *adaptiveLimiter) growLocked() {
-	if l.limit >= l.max {
+	top := l.headroom()
+	if l.limit >= top {
 		return
 	}
 	// Recovering from a hole, climb geometrically: coming back from the floor
@@ -217,7 +231,7 @@ func (l *adaptiveLimiter) growLocked() {
 			step = l.ssthresh - l.limit
 		}
 	}
-	l.limit = math.Min(l.max, l.limit+step)
+	l.limit = math.Min(top, l.limit+step)
 	l.lastGrow = time.Now()
 	l.increases++
 	l.cond.Broadcast()
@@ -231,7 +245,7 @@ func (l *adaptiveLimiter) probe(now time.Time) {
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if l.limit >= l.max {
+	if l.limit >= l.headroom() {
 		return
 	}
 	if now.Sub(l.lastCut) < probeInterval || now.Sub(l.lastGrow) < probeInterval {
@@ -289,6 +303,34 @@ func (l *adaptiveLimiter) onThrottle() {
 	}
 }
 
+// setCeiling tells the limiter what the proxy pool can carry right now. It
+// moves as proxies are quarantined and recover.
+func (l *adaptiveLimiter) setCeiling(n int) {
+	if l == nil || !l.enabled {
+		return
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	if n < 1 {
+		l.ceiling = 0
+		return
+	}
+	l.ceiling = float64(n)
+	if l.limit > l.ceiling {
+		l.limit = math.Max(l.min, l.ceiling)
+	}
+}
+
+// headroom is the highest the cap may go: the smaller of what was asked for and
+// what the proxies can carry.
+func (l *adaptiveLimiter) headroom() float64 {
+	if l.ceiling > 0 && l.ceiling < l.max {
+		return l.ceiling
+	}
+	return l.max
+}
+
 // current reports the cap, for display. acquire admits while inflight < limit,
 // so a limit of 2.4 admits 3; reporting int(2.4) would understate the real
 // concurrency by one.
@@ -298,7 +340,7 @@ func (l *adaptiveLimiter) current() int {
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	return int(math.Ceil(l.limit))
+	return int(math.Ceil(math.Min(l.limit, l.headroom())))
 }
 
 // rateWindow smooths a monotonically increasing counter into a per-second rate

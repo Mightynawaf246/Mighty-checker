@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -835,4 +836,119 @@ func TestFailedAttemptsAreNotCountedAsLatency(t *testing.T) {
 	// A nil receiver must be safe: the pipeline passes stats optionally.
 	var nilStats *liveStats
 	nilStats.observeLatency(time.Second)
+}
+
+// A proxy is a machine with a connection limit, and past it requests do not
+// fail, they queue - so overloading a pool shows up as latency, not errors, and
+// adding threads makes it worse. Respecting the pool's capacity must therefore
+// beat brute force at the SAME thread count.
+//
+// Modelled on a real run: 100 proxies driven at 2089 concurrent checks, where
+// round trips had stretched to three seconds.
+func TestRespectingProxyCapacityBeatsBruteForce(t *testing.T) {
+	run := func(ceiling int) (float64, time.Duration) {
+		const proxies, comfy = 100, 10
+		var mu sync.Mutex
+		live := make([]int, proxies)
+		next := 0
+
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			mu.Lock()
+			id := next % proxies
+			next++
+			live[id]++
+			over := live[id] - comfy
+			mu.Unlock()
+
+			d := 40 * time.Millisecond
+			if over > 0 {
+				d += time.Duration(over) * 45 * time.Millisecond // queueing
+			}
+			time.Sleep(d)
+
+			mu.Lock()
+			live[id]--
+			mu.Unlock()
+			fmt.Fprint(w, bodyTaken)
+		}))
+		defer srv.Close()
+		withEndpoint(t, srv.URL)
+
+		const threads = 1000
+		cfg := &config{threads: threads, timeout: 60 * time.Second, retries: 1,
+			outDir: t.TempDir(), quiet: true, loop: true}
+		wl := newWorklist([]string{"a", "b", "c"}, true)
+		stats := &liveStats{}
+		sink := newResultSink(cfg)
+		lim := newAdaptiveLimiter(threads, true)
+		if ceiling > 0 {
+			lim.setCeiling(ceiling)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+
+		start := time.Now()
+		runPipeline(ctx, wl, newProxyPool(nil), newClientCacheFor(cfg.timeout, threads),
+			cfg, sink, stats, lim, start)
+		el := time.Since(start)
+		sink.close()
+
+		var lat time.Duration
+		if c := stats.latencyCount.Load(); c > 0 {
+			lat = time.Duration(stats.latencyNanos.Load() / c)
+		}
+		return float64(stats.attempts.Load()) / el.Seconds(), lat
+	}
+
+	brute, bruteLat := run(0)
+	capped, cappedLat := run(100 * 10)
+	t.Logf("brute force: %.0f req/s at %v   capacity respected: %.0f req/s at %v",
+		brute, bruteLat.Round(time.Millisecond), capped, cappedLat.Round(time.Millisecond))
+
+	if capped <= brute {
+		t.Errorf("respecting capacity did not help: %.0f -> %.0f req/s", brute, capped)
+	}
+	if cappedLat >= bruteLat {
+		t.Errorf("respecting capacity did not reduce latency: %v -> %v", bruteLat, cappedLat)
+	}
+}
+
+// The ceiling moves with the pool: proxies leaving and rejoining change what it
+// can carry, and the cap has to follow both ways.
+func TestCeilingFollowsThePool(t *testing.T) {
+	lim := newAdaptiveLimiter(1000, true)
+	if got := lim.current(); got != 1000 {
+		t.Fatalf("start: %d", got)
+	}
+
+	lim.setCeiling(200) // 20 healthy proxies at 10 each
+	if got := lim.current(); got != 200 {
+		t.Errorf("cap should follow the ceiling down: %d", got)
+	}
+
+	// Clean answers must not climb past it.
+	for i := 0; i < 5000; i++ {
+		lim.onClean()
+	}
+	if got := lim.current(); got != 200 {
+		t.Errorf("cap climbed past what the proxies can carry: %d", got)
+	}
+
+	// Proxies recover, and the cap may climb again.
+	lim.setCeiling(800)
+	for i := 0; i < 5000; i++ {
+		lim.onClean()
+	}
+	if got := lim.current(); got <= 200 {
+		t.Errorf("cap did not recover with the pool: %d", got)
+	}
+
+	// No proxies means no ceiling.
+	lim.setCeiling(0)
+	for i := 0; i < 20000; i++ {
+		lim.onClean()
+	}
+	if got := lim.current(); got != 1000 {
+		t.Errorf("with no ceiling the cap should reach -t: %d", got)
+	}
 }

@@ -50,6 +50,7 @@ type config struct {
 	checkProxiesOnly bool
 	pruneProxies     bool
 	targetRPS        int
+	perProxy         int
 }
 
 // liveStats holds counters written by workers and read by the status line, so
@@ -269,6 +270,15 @@ const (
 	// maxRetries bounds attempts per username. Beyond a handful, more attempts
 	// stop being resilience and become repetition against the same rate limit.
 	maxRetries = 10
+
+	// defaultPerProxy is how many checks may be in flight through one proxy.
+	//
+	// A proxy is a machine with a connection limit of its own, and past it
+	// requests do not fail, they queue - so overloading one shows up as latency
+	// rather than as an error, and adding threads makes it worse. Ten is
+	// comfortable for a datacenter proxy and survivable for most others; a
+	// residential pool may want less, a dedicated one can take more.
+	defaultPerProxy = 10
 )
 
 // clampThreads keeps the worker count inside what a process can actually run.
@@ -453,6 +463,11 @@ func main() {
 	// One limiter for the whole run, so what it learns about the endpoint's
 	// tolerance is never thrown away.
 	lim := newAdaptiveLimiter(cfg.threads, !cfg.noAdapt)
+	if cfg.perProxy > 0 && pool.len() > 0 {
+		// Start from what the pool can carry rather than discovering it by
+		// overloading every proxy first.
+		lim.setCeiling(pool.healthy() * cfg.perProxy)
+	}
 
 	sink := newResultSink(cfg)
 	defer sink.close()
@@ -749,6 +764,16 @@ func printConfig(cfg *config, usernames []string, pool *proxyPool) {
 		row("Adaptive", cGreen("on (tuned to the endpoint)"))
 	default:
 		row("Adaptive", cGreen(fmt.Sprintf("on (up to %d, tuned to the endpoint)", cfg.threads)))
+	}
+	if n := pool.len(); n > 0 && cfg.perProxy > 0 {
+		carry := n * cfg.perProxy
+		text := fmt.Sprintf("%d in flight per proxy - %d proxies carry %d at once",
+			cfg.perProxy, n, carry)
+		if carry < cfg.threads {
+			row("Capacity", cYellow(text+fmt.Sprintf(", below -t %d", cfg.threads)))
+		} else {
+			row("Capacity", cGreen(text))
+		}
 	}
 	if cfg.http2 {
 		row("Protocol", cYellow("HTTP/2 (one connection per host - caps concurrency)"))
@@ -1242,6 +1267,17 @@ func runWriter(ctx context.Context, results <-chan result, cfg *config, con *con
 		now := time.Now()
 		checked := counts.total()
 		attempts := stats.attempts.Load()
+
+		// What the proxy pool can carry right now. Recomputed each refresh
+		// because quarantined proxies come and go, and the capacity moves with
+		// them.
+		if cfg.perProxy > 0 && pool.len() > 0 {
+			healthy := pool.healthy()
+			if healthy < 1 {
+				healthy = 1
+			}
+			lim.setCeiling(healthy * cfg.perProxy)
+		}
 
 		// Give the limiter a chance to widen on its own. A run whose answers
 		// have all gone inconclusive supplies neither clean answers nor throttle
@@ -1751,6 +1787,8 @@ func parseFlags() *config {
 		"remove proxies that failed the test from the proxies file")
 	flag.IntVar(&cfg.targetRPS, "target", 0,
 		"aim for this many requests per second; sets -t from the measured latency")
+	flag.IntVar(&cfg.perProxy, "per-proxy", defaultPerProxy,
+		"max requests in flight through one proxy (0 = no limit)")
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, `Mighty - Instagram username availability checker
@@ -1779,6 +1817,7 @@ options:
   -prune-proxies        remove failed proxies from the proxies file
   -no-proxy-check       skip the pre-flight proxy test
   -target N             aim for N requests/sec; sets -t from measured latency
+  -per-proxy N          max requests in flight per proxy    (default 10)
   -update               check for a new version and update in place
   -version              print the version and exit
   -no-update-check      skip the startup update check
