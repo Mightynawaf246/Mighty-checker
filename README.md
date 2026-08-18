@@ -71,8 +71,9 @@ Run the tool with no flags and it shows a menu, then asks for settings:
 ```
  [ Mighty Menu ] v1.6.0
   1  Start checking
-  2  Check for updates      <- the update button
-  3  Quit
+  2  Test my proxies        <- how many are alive, and how fast
+  3  Check for updates      <- the update button
+  4  Quit
 
   choice: [1] 1
   Threads: [10] 100
@@ -117,6 +118,14 @@ Three things come out of this:
 - **The run starts calibrated.** Every measurement is fed into the pool, so the
   slow-proxy steering works from the first request instead of having to learn
   it, and dead proxies are already quarantined.
+
+Run it on its own at any time — menu option **2**, or:
+
+```
+mighty.exe -check-proxies
+```
+
+That needs no username list, so it works before your list is even ready.
 
 | Flag | Effect |
 |------|--------|

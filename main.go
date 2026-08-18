@@ -279,12 +279,18 @@ func main() {
 	seedFromExample(cfg.usernamesFile)
 	seedFromExample(cfg.proxiesFile)
 
-	usernames, err := loadLines(cfg.usernamesFile)
-	if err != nil {
-		fatalf("cannot read usernames file %s: %v", cfg.usernamesFile, err)
-	}
-	if len(usernames) == 0 {
-		fatalf("no usernames found in %s", cfg.usernamesFile)
+	// Testing proxies needs no usernames, so do not demand a list for it. This
+	// is the one command someone runs before their list is ready.
+	var usernames []string
+	if !cfg.checkProxiesOnly {
+		var err error
+		usernames, err = loadLines(cfg.usernamesFile)
+		if err != nil {
+			fatalf("cannot read usernames file %s: %v", cfg.usernamesFile, err)
+		}
+		if len(usernames) == 0 {
+			fatalf("no usernames found in %s", cfg.usernamesFile)
+		}
 	}
 
 	var pool *proxyPool
@@ -304,7 +310,16 @@ func main() {
 		}
 	}
 
-	printConfig(cfg, usernames, pool)
+	if cfg.checkProxiesOnly {
+		if pool.len() == 0 {
+			fatalf("no proxies to test - add some to %s", cfg.proxiesFile)
+		}
+		fmt.Println(" " + label(appName+" Proxy Test") + " " + cGray("v"+appVersion()))
+		fmt.Printf("  %s %s\n", cGray("Source   :"),
+			cWhite(fmt.Sprintf("%s (%d proxies)", cfg.proxiesFile, pool.len())))
+	} else {
+		printConfig(cfg, usernames, pool)
+	}
 
 	// Quick best-effort notice if an update exists (short timeout).
 	if !cfg.noUpdateCheck && !cfg.quiet {
@@ -347,11 +362,16 @@ func main() {
 					cfg.proxiesFile, kept)))
 			}
 		}
+		if cfg.checkProxiesOnly {
+			// A test run reports and stops; it is not about to need them.
+			if alive == 0 {
+				fmt.Println()
+				fmt.Println("  " + cRed("none of these proxies work."))
+			}
+			return
+		}
 		if alive == 0 {
 			fatalf("no working proxies - fix the list above, or run with -no-proxy to connect directly")
-		}
-		if cfg.checkProxiesOnly {
-			return
 		}
 		fmt.Println()
 		fmt.Println(" " + label("Logs"))
@@ -454,8 +474,9 @@ func runInteractiveSetup(cfg *config) bool {
 	for {
 		fmt.Println(" " + label(appName+" Menu") + " " + cGray("v"+appVersion()))
 		fmt.Println("  " + cCyan("1") + cGray("  Start checking"))
-		fmt.Println("  " + cCyan("2") + cGray("  Check for updates"))
-		fmt.Println("  " + cCyan("3") + cGray("  Quit"))
+		fmt.Println("  " + cCyan("2") + cGray("  Test my proxies"))
+		fmt.Println("  " + cCyan("3") + cGray("  Check for updates"))
+		fmt.Println("  " + cCyan("4") + cGray("  Quit"))
 		fmt.Println()
 
 		switch ask("choice:", "1") {
@@ -473,14 +494,21 @@ func runInteractiveSetup(cfg *config) bool {
 			return true
 
 		case "2":
+			// Test the proxies and stop there, so the report can be read
+			// without a run starting underneath it.
+			cfg.checkProxiesOnly = true
+			fmt.Println()
+			return true
+
+		case "3":
 			runUpdateCommand()
 			fmt.Println()
 
-		case "3", "q", "quit", "exit":
+		case "4", "q", "quit", "exit":
 			return false
 
 		default:
-			fmt.Println("  " + cRed("pick 1, 2 or 3"))
+			fmt.Println("  " + cRed("pick 1, 2, 3 or 4"))
 		}
 	}
 }
@@ -1548,7 +1576,7 @@ options:
   -quiet                suppress all console output
 
 Run with no flags on a terminal to get the interactive menu
-(start / check for updates / quit) and be asked for threads.
+(start / test proxies / check for updates / quit) and be asked for threads.
 If the menu does not appear, run with -menu to force it.
 
 proxy formats (all supported, scheme defaults to http):
