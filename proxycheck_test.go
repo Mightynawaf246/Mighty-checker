@@ -319,3 +319,53 @@ func TestPingFallsBackToTotal(t *testing.T) {
 		t.Errorf("ping = %v, want the connect phase", got)
 	}
 }
+
+// The thread count that reaches a requested rate is arithmetic - concurrency
+// equals rate times latency - so the tool should do it rather than leaving the
+// user to.
+func TestApplyTargetArithmetic(t *testing.T) {
+	mk := func(n int, rtt time.Duration) []proxyReport {
+		var out []proxyReport
+		for i := 0; i < n; i++ {
+			s, err := parseProxy(fmt.Sprintf("http://10.0.0.%d:8080", i+1))
+			if err != nil {
+				t.Fatal(err)
+			}
+			out = append(out, proxyReport{spec: s, tested: true, ok: true, rtt: rtt})
+		}
+		return out
+	}
+
+	cases := []struct {
+		name    string
+		proxies int
+		rtt     time.Duration
+		start   int
+		target  int
+		want    int
+	}{
+		{"fast datacenter", 200, 40 * time.Millisecond, 100, 5000, 200},
+		{"typical isp", 200, 100 * time.Millisecond, 100, 5000, 500},
+		{"slow residential", 200, 400 * time.Millisecond, 100, 5000, 2000},
+		{"already enough is left alone", 200, 40 * time.Millisecond, 500, 5000, 500},
+		{"beyond reach is capped, not pretended", 200, 2 * time.Second, 100, 5000, 4000},
+	}
+	for _, c := range cases {
+		cfg := &config{threads: c.start, targetRPS: c.target}
+		applyTarget(cfg, mk(c.proxies, c.rtt))
+		if cfg.threads != c.want {
+			t.Errorf("%s: latency %v, target %d -> threads %d, want %d",
+				c.name, c.rtt, c.target, cfg.threads, c.want)
+		}
+	}
+}
+
+// With nothing alive there is no latency to compute from, so the thread count
+// must be left exactly as the user set it.
+func TestApplyTargetWithNoMeasurements(t *testing.T) {
+	cfg := &config{threads: 250, targetRPS: 5000}
+	applyTarget(cfg, []proxyReport{{tested: true, ok: false}, {}})
+	if cfg.threads != 250 {
+		t.Errorf("threads changed to %d with nothing measured", cfg.threads)
+	}
+}

@@ -139,6 +139,7 @@ That needs no username list, so it works before your list is even ready.
 | `-check-proxies` | run the test, print the report, exit |
 | `-prune-proxies` | delete the proxies that were tested and failed (comments kept; anything not tested is left alone) |
 | `-no-proxy-check` | skip the pre-flight |
+| `-target N` | aim for N requests/sec — sets `-t` from the measured latency |
 
 Every proxy is then listed with its own numbers, fastest first, and the full
 list is written to `proxies-ping.txt` so a thousand-proxy report stays readable:
@@ -150,6 +151,40 @@ list is written to `proxies-ping.txt` so a thousand-proxy report stays readable:
   +    310ms  http://user:***@9.9.9.9:3128           total 437ms
   x        -  http://11.11.11.11:8080                proxy unreachable (dead proxy)
 ```
+
+## Hitting a rate you name
+
+Throughput is `concurrency / latency`. Latency is your proxies and cannot be
+argued with; concurrency is the one term you control. So the thread count that
+reaches a given rate is arithmetic, and the pre-flight has just measured the one
+unknown in it — no reason to do it by hand:
+
+```
+mighty.exe -target 5000 -loop
+```
+
+```
+ [ Target ]
+  Wanted   : 5000 req/sec
+  Latency  : 100ms measured
+  Threads  : 200 -> 500
+```
+
+What the same target costs at different proxy speeds, all for 5 000/sec:
+
+| measured latency | threads needed |
+|------------------|----------------|
+| 40ms (datacenter) | 200 |
+| 100ms (ISP) | 500 |
+| 200ms | 1 000 |
+| 400ms (residential) | 2 000 |
+
+It will not pretend. If the target needs more than about 4 000 threads it says
+so and stops there, because past the point where the machine saturates more
+goroutines cost more than they earn — at that latency, faster proxies are the
+only way. It also warns when the thread count works out to more than ~25 per
+working proxy, since spreading a small pool that thin gets every member of it
+throttled.
 
 ## Keeping the rate steady
 

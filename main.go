@@ -49,6 +49,7 @@ type config struct {
 	noProxyCheck     bool
 	checkProxiesOnly bool
 	pruneProxies     bool
+	targetRPS        int
 }
 
 // liveStats holds counters written by workers and read by the status line, so
@@ -341,17 +342,20 @@ func main() {
 		stop()
 	}()
 
-	cache := newClientCacheFor(cfg.timeout, cfg.threads).withHTTP2(cfg.http2)
-	defer cache.closeIdle()
-
 	// Test the proxies before checking a single username. A proxy list is the
 	// one input that cannot be validated by reading it: a line that parses
 	// perfectly can still be expired or pointed at a host that stopped
 	// answering. Finding that out here, with the reason stated, beats a slow
 	// run full of unexplained errors.
+	//
+	// The pre-flight gets its own client cache: it is one request per proxy,
+	// and -target may change the thread count afterwards, which is what the
+	// run's connection pools are sized from.
 	if pool.len() > 0 && !cfg.noProxyCheck {
-		reports := checkProxies(ctx, pool, cache, cfg, newConsole(cfg))
+		pre := newClientCacheFor(cfg.timeout, 64).withHTTP2(cfg.http2)
+		reports := checkProxies(ctx, pool, pre, cfg, newConsole(cfg))
 		alive := printProxyReport(cfg, reports)
+		pre.closeIdle()
 
 		if cfg.pruneProxies {
 			kept, err := pruneProxies(cfg.proxiesFile, reports)
@@ -373,9 +377,19 @@ func main() {
 		if alive == 0 {
 			fatalf("no working proxies - fix the list above, or run with -no-proxy to connect directly")
 		}
+
+		// The thread count that reaches a requested rate is arithmetic, and
+		// the pre-flight has just measured the one unknown in it.
+		if cfg.targetRPS > 0 {
+			applyTarget(cfg, reports)
+		}
+
 		fmt.Println()
 		fmt.Println(" " + label("Logs"))
 	}
+
+	cache := newClientCacheFor(cfg.timeout, cfg.threads).withHTTP2(cfg.http2)
+	defer cache.closeIdle()
 
 	// One limiter for the whole run, so what it learns about the endpoint's
 	// tolerance is never thrown away.
@@ -404,6 +418,69 @@ func main() {
 	elapsed := time.Since(start)
 	printSummary(cfg, counts, elapsed, ctx.Err() != nil, wl.passCount(), lim, pool,
 		stats.attempts.Load(), len(usernames))
+}
+
+// applyTarget sets the thread count from a requested rate and the latency the
+// pre-flight just measured.
+//
+// Throughput is concurrency divided by latency. Latency is the user's proxies
+// and cannot be argued with; concurrency is the one term they control. So the
+// thread count that reaches a given rate is arithmetic, not guesswork - there
+// is no reason to make somebody do it by hand.
+func applyTarget(cfg *config, reports []proxyReport) {
+	var rtts []time.Duration
+	for _, r := range reports {
+		if r.tested && r.ok {
+			rtts = append(rtts, r.rtt)
+		}
+	}
+	if len(rtts) == 0 {
+		return
+	}
+	sort.Slice(rtts, func(i, j int) bool { return rtts[i] < rtts[j] })
+	med := pctl(rtts, 50).Seconds()
+	if med <= 0 {
+		return
+	}
+
+	want := int(float64(cfg.targetRPS) * med)
+	if want < 1 {
+		want = 1
+	}
+
+	fmt.Println()
+	fmt.Println(" " + label("Target"))
+	row := func(k, v string) {
+		fmt.Printf("  %s %s\n", cGray(fmt.Sprintf("%-9s:", k)), v)
+	}
+	row("Wanted", cWhite(fmt.Sprintf("%d req/sec", cfg.targetRPS)))
+	row("Latency", cCyan(fmt.Sprintf("%v measured", pctl(rtts, 50).Round(time.Millisecond))))
+
+	if want <= cfg.threads {
+		row("Threads", cGreen(fmt.Sprintf("%d is already enough (%d would do)", cfg.threads, want)))
+		return
+	}
+
+	// Refuse to pretend. Past the point where the machine itself saturates,
+	// more goroutines cost more than they earn, and a proxy pool spread too
+	// thin gets every one of its members throttled.
+	const sane = 4000
+	if want > sane {
+		row("Threads", cYellow(fmt.Sprintf("%d needed - more than this tool can drive usefully", want)))
+		row("Reality", cGray(fmt.Sprintf(
+			"at %v per request, %d req/sec needs %d in flight. Faster proxies are the "+
+				"only way there; %d is as far as raising -t goes.",
+			pctl(rtts, 50).Round(time.Millisecond), cfg.targetRPS, want, sane)))
+		want = sane
+	}
+
+	row("Threads", cGreen(fmt.Sprintf("%d -> %d", cfg.threads, want)))
+	if n := len(rtts); want/n > 25 {
+		row("Warning", cYellow(fmt.Sprintf(
+			"that is %d threads per working proxy - expect throttling, add proxies",
+			want/n)))
+	}
+	cfg.threads = want
 }
 
 // printSpeedDiagnosis names the actual bottleneck of the run just finished.
@@ -1555,6 +1632,8 @@ func parseFlags() *config {
 		"test the proxies, print the report, and exit")
 	flag.BoolVar(&cfg.pruneProxies, "prune-proxies", false,
 		"remove proxies that failed the test from the proxies file")
+	flag.IntVar(&cfg.targetRPS, "target", 0,
+		"aim for this many requests per second; sets -t from the measured latency")
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, `Mighty - Instagram username availability checker
@@ -1582,6 +1661,7 @@ options:
   -check-proxies        test the proxies, print the report, and exit
   -prune-proxies        remove failed proxies from the proxies file
   -no-proxy-check       skip the pre-flight proxy test
+  -target N             aim for N requests/sec; sets -t from measured latency
   -update               check for a new version and update in place
   -version              print the version and exit
   -no-update-check      skip the startup update check
