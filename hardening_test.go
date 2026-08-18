@@ -952,3 +952,40 @@ func TestCeilingFollowsThePool(t *testing.T) {
 		t.Errorf("with no ceiling the cap should reach -t: %d", got)
 	}
 }
+
+// Freshness is what a watch list actually optimises, and it is dominated by the
+// round trip rather than the request rate. The tool has to report it that way,
+// or the user optimises the number that does not matter.
+func TestFreshnessIsDominatedByLatency(t *testing.T) {
+	const names = 3
+	slow := 3 * time.Second
+
+	// Forty times the request rate, on a slow pool.
+	lo := freshness(slow, names, 10)
+	hi := freshness(slow, names, 435)
+	t.Logf("3s proxies: 10/sec -> %v, 435/sec -> %v", lo.Round(time.Millisecond), hi.Round(time.Millisecond))
+	if improvement := float64(lo-hi) / float64(lo); improvement > 0.15 {
+		t.Errorf("43x the rate improved freshness by %.0f%% - the model is wrong", improvement*100)
+	}
+
+	// A fifteen-fold faster pool, at a fraction of the rate.
+	fast := freshness(200*time.Millisecond, names, 100)
+	t.Logf("200ms proxies at 100/sec -> %v", fast.Round(time.Millisecond))
+	if fast >= hi {
+		t.Errorf("faster proxies at a lower rate should win: %v vs %v", fast, hi)
+	}
+	if fast > hi/5 {
+		t.Errorf("faster proxies should win by a wide margin: %v vs %v", fast, hi)
+	}
+
+	// Degenerate inputs must not produce a number.
+	if got := freshness(0, names, 100); got != 0 {
+		t.Errorf("no latency measured yet: %v", got)
+	}
+	if got := freshness(time.Second, 0, 100); got != 0 {
+		t.Errorf("no names: %v", got)
+	}
+	if got := freshness(time.Second, names, 0); got != 0 {
+		t.Errorf("nothing completing: %v", got)
+	}
+}

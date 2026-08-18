@@ -557,6 +557,24 @@ func applyTarget(cfg *config, reports []proxyReport) {
 	cfg.threads = want
 }
 
+// freshness is how stale the newest answer about a watched name can be: one
+// round trip, plus the wait until that name comes round again.
+//
+// This is what a watch list is actually optimising, and it is dominated by the
+// round trip rather than by the request rate. Once the gap between two checks
+// of the same name is small next to one round trip, more requests stop buying
+// detection speed and only spend rate limit.
+func freshness(lat time.Duration, names, ups int) time.Duration {
+	if lat <= 0 || names <= 0 {
+		return 0
+	}
+	if ups <= 0 {
+		return 0
+	}
+	gap := time.Duration(float64(names) / float64(ups) * float64(time.Second))
+	return lat + gap
+}
+
 // printSpeedDiagnosis names the actual bottleneck of the run just finished.
 //
 // Throughput here is always concurrency divided by latency, so a disappointing
@@ -1310,6 +1328,7 @@ func runWriter(ctx context.Context, results <-chan result, cfg *config, con *con
 			Elapsed:    now.Sub(start),
 			Cus:        effectiveConcurrency(lim, usefulConcurrency(cfg.threads, left, cfg.loop)),
 			Latency:    lat,
+			Fresh:      freshness(lat, left, ups),
 			Threads:    cfg.threads,
 			ProxiesOK:  pool.healthy(),
 			ProxiesAll: pool.len(),

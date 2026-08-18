@@ -139,6 +139,18 @@ type statusView struct {
 	// CUS / Latency, so whichever one moved is the one to act on.
 	Latency time.Duration
 
+	// Fresh is how stale the newest answer about a watched name can be:
+	// one round trip, plus the wait until that name's turn comes round again.
+	//
+	// For a watch list this is the number that matters, and it is not the
+	// request rate. Every answer is already one round trip old when it
+	// arrives, so once the gap between checks is small next to the round
+	// trip, more requests buy almost nothing: on a 3-name list answered in
+	// 3s, going from 10 checks/sec to 435 moves detection from 3.30s to
+	// 3.01s - forty times the requests for nine percent. Halving the round
+	// trip halves this outright.
+	Fresh time.Duration
+
 	ProxiesOK  int // proxies not currently quarantined
 	ProxiesAll int // proxies loaded
 }
@@ -180,6 +192,9 @@ func buildStatus(name string, v statusView) string {
 	}
 	if v.Latency > 0 {
 		line += seg("LAT", v.Latency.Round(time.Millisecond).String()) + sep
+	}
+	if v.Loop && v.Fresh > 0 {
+		line += seg("FRESH", v.Fresh.Round(time.Millisecond).String()) + sep
 	}
 
 	// Proxy health, shown only when proxies are in play.

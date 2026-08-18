@@ -197,6 +197,39 @@ only way. It also warns when the thread count works out to more than ~25 per
 working proxy, since spreading a small pool that thin gets every member of it
 throttled.
 
+## Watching a short list: the rate is not the point
+
+When you are watching a handful of names for a drop, the number that matters is
+not requests per second. It is **how stale the newest answer can be**: one round
+trip, plus the wait until that name comes round again. That is the `FRESH`
+field.
+
+Every answer is already one round trip old when it arrives, so once the gap
+between two checks of a name is small next to the round trip, more requests stop
+buying detection speed. Three names, answered in 3s:
+
+| checks/sec | gap between checks | detection |
+|------------|--------------------|-----------|
+| 1 | 3 000ms | 6.00s |
+| 10 | 300ms | 3.30s |
+| 100 | 30ms | 3.03s |
+| 435 | 7ms | **3.01s** |
+
+Going from 10/sec to 435 — forty-three times the requests — improves detection
+by 0.29 seconds. The round trip is the whole number.
+
+Now the same list on proxies that answer in 200ms instead of 3s:
+
+| checks/sec | detection |
+|------------|-----------|
+| 10 | 0.50s |
+| 100 | **0.23s** |
+
+**Faster proxies at a quarter of the rate beat the fast pool by thirteen
+times.** For a short watch list, latency is everything and rate is almost
+nothing — and the extreme rate is what invites the throttling that pushes
+latency up in the first place.
+
 ## Proxy capacity: why more threads can make it slower
 
 A proxy is a machine with a connection limit of its own. Past it, requests do
@@ -441,6 +474,7 @@ sends one, with exponential backoff otherwise.
 | `Chk` | checked out of the round total, with percentage |
 | `CUS` | concurrency in use, shown as `used/asked` when they differ |
 | `LAT` | mean round trip right now — the other half of the rate |
+| `FRESH` | how stale the newest answer about a watched name can be (loop mode) |
 | `Left` | names still being watched (loop mode) |
 | `xN` | complete sweeps of the list finished so far (loop mode) |
 | `PX` | healthy proxies out of the total (hidden without proxies) |
