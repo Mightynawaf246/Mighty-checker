@@ -167,8 +167,13 @@ func testProxy(ctx context.Context, p *proxySpec, cache *clientCache, timeout ti
 		GotFirstResponseByte: func() { firstByte = time.Now() },
 	})
 
+	// The probe name is random, so nothing is registered under it and the only
+	// correct answer is AVAILABLE. That makes the test far stronger than a
+	// reachability check: a proxy that answers TAKEN is not merely reachable
+	// and wrong, it is soft-blocked, and every name checked through it would
+	// come back taken - silently, with no error to show for it.
 	start := time.Now()
-	resp, err := checkOnce(rctx, client, randomString(12))
+	resp, err := checkOnce(rctx, client, randomString(probeNameLen))
 	rep.rtt = time.Since(start)
 
 	if !gotConn.IsZero() {
@@ -186,8 +191,15 @@ func testProxy(ctx context.Context, p *proxySpec, cache *clientCache, timeout ti
 
 	status, _ := interpret(resp.code, resp.body)
 	switch status {
-	case statusAvailable, statusTaken:
+	case statusAvailable:
+		// The only right answer about a name nothing is registered under.
 		rep.ok = true
+	case statusTaken:
+		// Reachable, answering, and lying. Accepting this as healthy is what
+		// let a pool of soft-blocked proxies pass the pre-flight and then
+		// report every single name as taken - a run that finds nothing, logs
+		// nothing, and looks like the list simply had no hits in it.
+		rep.reason = "soft-blocked: says a random name that cannot exist is taken"
 	case statusUnknown:
 		if resp.code == 429 {
 			rep.reason = "rate limited (HTTP 429)"
@@ -199,6 +211,16 @@ func testProxy(ctx context.Context, p *proxySpec, cache *clientCache, timeout ti
 	}
 	return rep
 }
+
+// probeNameLen is the length of the random name the pre-flight asks about.
+//
+// Twelve, because it has to look like an ordinary username. The point is to
+// learn whether the proxy gives honest answers, and a name of an unusual shape
+// risks being refused for its shape rather than answered on its merits - which
+// would read as a soft block when it is nothing of the kind. Thirty-six to the
+// twelfth is 4.7 x 10^18 possibilities against some 2 x 10^9 accounts, so the
+// chance of accidentally naming a real one is about one in four billion.
+const probeNameLen = 12
 
 // printProxyReport shows what the pre-flight found, and turns the measured
 // latency into the only number that predicts throughput.

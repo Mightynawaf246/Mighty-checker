@@ -244,7 +244,10 @@ func TestLatencySplitAttribution(t *testing.T) {
 	const serverThink = 150 * time.Millisecond
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		time.Sleep(serverThink)
-		fmt.Fprint(w, bodyTaken)
+		// Available, because the pre-flight asks about a name it invented at
+		// random and that is the only honest answer to it. Answering "taken"
+		// here would now be read - correctly - as a soft block.
+		fmt.Fprint(w, bodyAvailable)
 	}))
 	t.Cleanup(srv.Close)
 	withEndpoint(t, srv.URL)

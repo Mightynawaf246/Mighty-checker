@@ -389,6 +389,39 @@ So `available.txt` is a list of names the endpoint says nothing is registered
 under. That is the strongest signal this endpoint can give, and it is not a
 promise. No checker built on it can do better.
 
+## The worst kind of proxy is the one that answers
+
+A dead proxy is easy: it times out, you see errors, you replace it. The
+expensive one is the proxy that is reachable, fast, returns HTTP 200 — and
+**calls every name taken**. That is what Instagram does to a datacenter IP it
+has decided not to serve: it does not block you, it just stops telling you the
+truth.
+
+Nothing about that looks wrong. There are no errors, the rate is healthy, the
+proxy report is all green — and the run finds nothing, because every real hit
+reads as taken. Hours of checking, an empty `available.txt`, and no clue why.
+
+The pre-flight used to pass those proxies, and the reason was embarrassing: it
+asked each one about a **random 12-character name** — a name nothing could
+possibly be registered under — and then accepted **`taken`** as proof of health.
+
+It now accepts only the one honest answer:
+
+```
+ [ Why proxies failed ]
+  1      soft-blocked: says a random name that cannot exist is taken
+```
+
+The proxy is failed, moved to `proxies-dead.txt` with that reason, and if the
+whole pool is like that the run does not start. The self test carries the same
+check for the pool as a whole, using several ordinary-length names rather than
+one — a single unusual length cannot tell *"this endpoint calls everything
+taken"* apart from *"this endpoint refuses names of that shape"*, and reading
+the second as the first is a false alarm on a healthy setup.
+
+If you are seeing a run with no logs, no errors, and no hits, this is almost
+certainly what is happening. `-check-proxies` now says so outright.
+
 ## Dead proxies are moved, not deleted
 
 A proxy the pre-flight proves dead leaves the live list and lands in

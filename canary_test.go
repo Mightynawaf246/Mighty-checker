@@ -207,7 +207,7 @@ func TestSelfTestKeepsWatchingDuringTheRun(t *testing.T) {
 func TestFreeCanaryNamesAreValidAndUnique(t *testing.T) {
 	seen := map[string]bool{}
 	for i := 0; i < 500; i++ {
-		n := randomString(freeCanaryLen)
+		n := randomString(freeCanaryLens[i%len(freeCanaryLens)])
 		if !validUsername(n) {
 			t.Fatalf("%q is not a name the endpoint would accept", n)
 		}
@@ -216,12 +216,73 @@ func TestFreeCanaryNamesAreValidAndUnique(t *testing.T) {
 		}
 		seen[n] = true
 	}
-	if freeCanaryLen > 30 {
-		t.Errorf("free canary is %d chars; Instagram's limit is 30", freeCanaryLen)
+	if freeCanaryLens[len(freeCanaryLens)-1] > 30 {
+		t.Errorf("free canary is too long for Instagram's 30-char limit")
 	}
 	for _, c := range takenCanaries {
 		if !validUsername(c) {
 			t.Errorf("%q is not a valid username", c)
 		}
+	}
+}
+
+// A proxy that is reachable, answering, and soft-blocked is the worst kind:
+// every name reads taken, the run finds nothing, and there is no error anywhere
+// to show for it. The pre-flight used to pass those, because it accepted TAKEN
+// as proof of health - about a name it had invented at random.
+func TestProxyProbeRejectsASoftBlockedProxy(t *testing.T) {
+	cases := []struct {
+		name    string
+		body    string
+		code    int
+		wantOK  bool
+		wantWhy string
+	}{
+		{"honest proxy", canaryFree, 200, true, ""},
+		{"soft-blocked: everything reads taken", canaryTaken, 200, false, "soft-blocked"},
+		{"rate limited", "", 429, false, "rate limited"},
+		{"block page", "<html>denied</html>", 200, false, "not a valid answer"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(c.code)
+				w.Write([]byte(c.body))
+			}))
+			defer srv.Close()
+			old := graphqlURL
+			graphqlURL = srv.URL
+			defer func() { graphqlURL = old }()
+
+			rep := testProxy(context.Background(), nil,
+				newClientCacheFor(5*time.Second, 2, 0), 5*time.Second)
+
+			if rep.ok != c.wantOK {
+				t.Errorf("ok=%v, want %v (reason %q)", rep.ok, c.wantOK, rep.reason)
+			}
+			if c.wantWhy != "" && !strings.Contains(rep.reason, c.wantWhy) {
+				t.Errorf("reason %q should mention %q", rep.reason, c.wantWhy)
+			}
+		})
+	}
+}
+
+// The probe name has to look like an ordinary username, or a refusal of its
+// SHAPE reads as a soft block - a false alarm on a perfectly good proxy.
+func TestProbeAndCanaryNamesLookOrdinary(t *testing.T) {
+	if probeNameLen < 8 || probeNameLen > 20 {
+		t.Errorf("probe name is %d chars - not an ordinary username length", probeNameLen)
+	}
+	for _, n := range freeCanaryLens {
+		if n < 8 || n > 20 {
+			t.Errorf("free canary length %d is not an ordinary username length", n)
+		}
+		if !validUsername(randomString(n)) {
+			t.Errorf("a %d-char random name is not a valid username", n)
+		}
+	}
+	if len(freeCanaryLens) < 2 {
+		t.Error("one length cannot tell 'everything reads taken' from " +
+			"'names of that shape are refused'")
 	}
 }

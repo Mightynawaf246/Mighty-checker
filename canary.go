@@ -45,10 +45,17 @@ import (
 // being renamed some day.
 var takenCanaries = []string{"instagram", "nasa", "nike"}
 
-// freeCanaryLen is the length of the random names used for the other half of
-// the test. Twenty-four characters out of 36 is 36^24 possibilities: a
-// collision with a registered account is not a thing that happens.
-const freeCanaryLen = 24
+// freeCanaryLens are the lengths of the random names used for the other half of
+// the test.
+//
+// Several lengths, all ordinary ones, deliberately. A name has to be long
+// enough that nothing is registered under it - even ten characters out of 36 is
+// 3.7 x 10^15 possibilities against some 2 x 10^9 accounts - and it also has to
+// look like a username somebody might really pick. A single unusual length
+// cannot tell "this endpoint calls everything taken" apart from "this endpoint
+// refuses names of that shape", and reading the second as the first is a false
+// alarm on a healthy setup.
+var freeCanaryLens = []int{10, 13, 16}
 
 // contractCheckInterval is how often the test is repeated during a run. Meta
 // can rotate a doc_id at any moment, including an hour into a sweep, so
@@ -144,11 +151,11 @@ func (g *contractGuard) verify(ctx context.Context) contractVerdict {
 
 	// The other direction: names that cannot exist must come back free.
 	freeSeen, freeWrong := 0, 0
-	for i := 0; i < 2; i++ {
+	for _, n := range freeCanaryLens {
 		if ctx.Err() != nil {
 			return contractVerdict{ok: true, reason: "cancelled"}
 		}
-		res := g.ask(ctx, randomString(freeCanaryLen))
+		res := g.ask(ctx, randomString(n))
 		switch res.status {
 		case statusAvailable:
 			freeSeen++
@@ -161,10 +168,12 @@ func (g *contractGuard) verify(ctx context.Context) contractVerdict {
 
 	if freeSeen == 0 && freeWrong > 0 {
 		return contractVerdict{
-			reason: "the endpoint reported a random 24-character name as TAKEN",
-			detail: "nothing is registered under a name like that, so the endpoint is " +
-				"calling everything taken. This run would find nothing however many " +
-				"names it checked - every real hit would be missed.",
+			reason: "every random name came back TAKEN",
+			detail: "nothing is registered under names like those, so something is " +
+				"calling everything taken. Almost always this is proxies being " +
+				"soft-blocked: they answer, they look healthy, and every name reads " +
+				"taken. The run would find nothing however many names it checked, and " +
+				"there would be no error anywhere to show for it. Run -check-proxies.",
 		}
 	}
 
@@ -202,8 +211,8 @@ func (g *contractGuard) runStartupCheck(ctx context.Context) contractVerdict {
 	switch {
 	case v.ok:
 		row("Contract", cGreen("intact"))
-		row("Checked", cGray(fmt.Sprintf("@%s and 2 names that cannot exist",
-			strings.Join(takenCanaries, ", @"))))
+		row("Checked", cGray(fmt.Sprintf("@%s and %d names that cannot exist",
+			strings.Join(takenCanaries, ", @"), len(freeCanaryLens))))
 	case v.fatal:
 		row("Contract", cRed("BROKEN"))
 		row("Problem", cRed(v.reason))
