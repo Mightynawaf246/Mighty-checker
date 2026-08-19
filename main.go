@@ -51,6 +51,7 @@ type config struct {
 	keepDeadProxies  bool
 	noSelfTest       bool
 	selfTestOnly     bool
+	onAvailable      string
 	targetRPS        int
 	perProxy         int
 }
@@ -938,6 +939,9 @@ func printConfig(cfg *config, usernames []string, pool *proxyPool) {
 	if cfg.webhook != "" {
 		row("Webhook", cGreen("on"))
 	}
+	if cfg.onAvailable != "" {
+		row("On hit", cGreen(truncate(cfg.onAvailable, 60)))
+	}
 	if cfg.debug {
 		row("Endpoint", cGray(graphqlURL))
 		row("doc_id", cGray(docID))
@@ -1448,12 +1452,21 @@ func runWriter(ctx context.Context, results <-chan result, cfg *config, con *con
 	// Webhooks are batched and sent from their own goroutine, so a burst of
 	// hits never fans out one request per hit from the writer.
 	hooks := newWebhookNotifier(ctx, cfg.webhook, con)
+
+	// Fired the instant a name is confirmed free, ahead of the batched webhook
+	// and off this goroutine. Everything upstream exists to make the gap
+	// between a name coming free and somebody acting on it small; a ten-second
+	// webhook batch is not that.
+	onHit := newHookRunner(cfg.onAvailable, con)
+
 	defer func() {
 		hooks.stop()
+		onHit.stop()
 		sink.flush()
 	}()
 
 	record := sink.record
+	fireHook := func(name string) { onHit.fire(ctx, name) }
 
 	// RPS/UPS are averaged over a trailing window rather than over the gap
 	// between two refreshes, which reads zero on any tick that happened to be
@@ -1554,7 +1567,7 @@ func runWriter(ctx context.Context, results <-chan result, cfg *config, con *con
 			if wl.retiredName(res.username) {
 				continue
 			}
-			handleResult(res, cfg, con, &counts, record, sink.flushBucket, hooks)
+			handleResult(res, cfg, con, &counts, record, sink.flushBucket, hooks, fireHook)
 
 			// This goroutine is the single owner of the list's lifecycle, so
 			// retirement happens here and nowhere else.
@@ -1601,7 +1614,7 @@ func runWriter(ctx context.Context, results <-chan result, cfg *config, con *con
 // everything in verbose mode, keeping the live status line clean.
 func handleResult(res result, cfg *config, con *console,
 	counts *tally, record func(string, string), flushNow func(string),
-	hooks *webhookNotifier) {
+	hooks *webhookNotifier, fireHook func(string)) {
 
 	// In debug mode dump exactly what came back, before classifying. This is the
 	// only way to see why a name was judged the way it was.
@@ -1631,6 +1644,12 @@ func handleResult(res result, cfg *config, con *console,
 				cYellow("  (unconfirmed - only one usable proxy)"))
 		} else {
 			con.log(cGreen("  ! Available : @" + res.username))
+		}
+		// The command first, then the batched notification. A claim script is
+		// the thing racing somebody else for the handle; a webhook message is
+		// not.
+		if fireHook != nil {
+			fireHook(res.username)
 		}
 		hooks.add(res.username)
 
@@ -1993,6 +2012,9 @@ func parseFlags() *config {
 		"skip the endpoint contract check (results may be silently wrong)")
 	flag.BoolVar(&cfg.selfTestOnly, "self-test", false,
 		"check that the endpoint still answers as this tool reads it, then exit")
+	flag.StringVar(&cfg.onAvailable, "on-available", "",
+		"run this command the instant a name is found free; the name is passed "+
+			"as an argument and as MIGHTY_USERNAME")
 	flag.IntVar(&cfg.targetRPS, "target", 0,
 		"aim for this many requests per second; sets -t from the measured latency")
 	flag.IntVar(&cfg.perProxy, "per-proxy", defaultPerProxy,
@@ -2016,6 +2038,9 @@ options:
   -verbose              log every result, not just available
   -no-color             disable colors and the live status line
   -webhook URL          notify this webhook on an available username
+  -on-available CMD     run CMD the instant a name is found free. The name is
+                        passed as an argument and as MIGHTY_USERNAME. Use it to
+                        claim the handle, wake your phone, or anything else.
   -loop                 keep re-checking the list forever until Ctrl-C
   -keep-list            do not remove available names from the usernames file
   -no-confirm           report available names without a confirming re-check

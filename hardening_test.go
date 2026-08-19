@@ -124,7 +124,7 @@ func TestAvailableIsFlushedImmediately(t *testing.T) {
 
 	var counts tally
 	handleResult(result{username: "alpha", status: statusAvailable},
-		cfg, newConsole(cfg), &counts, sink.record, sink.flushBucket, nil)
+		cfg, newConsole(cfg), &counts, sink.record, sink.flushBucket, nil, nil)
 
 	// Read it back without closing or flushing the sink.
 	data, err := os.ReadFile(filepath.Join(dir, "available.txt"))
@@ -297,7 +297,7 @@ func TestTallyRetainsNothingPerResult(t *testing.T) {
 	const hits = 50000
 	for i := 0; i < hits; i++ {
 		handleResult(result{username: fmt.Sprintf("hit%d", i), status: statusAvailable},
-			cfg, con, &counts, record, flush, nil)
+			cfg, con, &counts, record, flush, nil, nil)
 	}
 	if counts.available != hits {
 		t.Fatalf("counted %d hits, want %d", counts.available, hits)

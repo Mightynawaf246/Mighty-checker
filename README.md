@@ -389,6 +389,76 @@ So `available.txt` is a list of names the endpoint says nothing is registered
 under. That is the strongest signal this endpoint can give, and it is not a
 promise. No checker built on it can do better.
 
+## Acting on a hit: `-on-available`
+
+A hit is worth nothing until something acts on it. Everything upstream of the
+moment a name comes free exists to make the gap small — the rate, the proxies,
+the freshness metric — and then the tool wrote a line to a file and sent a
+webhook ten seconds later, and you found out when you next looked at your phone.
+
+So the instant a name is confirmed free, the tool runs a command you supply:
+
+```
+mighty -u username.txt -on-available './claim.sh "$1"'
+```
+
+Measured end to end: the script started **7ms** after the name was confirmed.
+
+The name arrives two ways:
+
+| | |
+|---|---|
+| `$1` | positional argument (Unix) |
+| `MIGHTY_USERNAME` | environment variable (**portable — use this on Windows**) |
+
+The command is run **verbatim**, never with the name pasted onto the end of it.
+Appending looks like it works and quietly does not: `./claim.sh > log.txt`
+would become `./claim.sh > log.txt name`, and the name lands after the redirect
+and reaches the wrong program.
+
+Guarantees:
+
+- **Once per name, ever** — while looping a name is in flight through several
+  workers at once, and a claim attempted twice is at best wasted.
+- **Off the writer's path** — the writer is the single consumer of every result
+  in the run and never waits behind your script.
+- **At most 4 at a time** — a burst of two hundred hits does not fork two
+  hundred processes.
+- **60-second timeout** — a hung script cannot pile up.
+- **Survives Ctrl-C** — a claim in flight when the sweep ends is the most
+  valuable thing in the run, and does not get killed for tidiness.
+
+What the command does is yours. Claim the handle, wake your phone, call an API —
+the tool does not need to know, and deliberately does not.
+
+### Writing the claim script
+
+The tool stops at the edge of your account on purpose: it never holds your
+credentials. A script that actually renames your account needs, from a logged-in
+browser session:
+
+- `sessionid` and `csrftoken` cookies
+- the `X-CSRFToken` and `X-IG-App-ID` headers the web app sends
+- a POST to Instagram's account-edit endpoint with the new username
+
+Three things to weigh before you build it, honestly:
+
+1. **Automating account actions breaks Instagram's terms**, and their detection
+   is far more aggressive on authenticated writes than on the read-only endpoint
+   this tool uses. The realistic outcome of a bot renaming an account the instant
+   a handle frees is that the account gets actioned.
+2. **A `sessionid` in a config file is your whole account in a plaintext file.**
+   Anything that reads that file is logged in as you.
+3. **The endpoint is undocumented and unverified here.** Everything else in this
+   tool was measured before it shipped; an authenticated write path that fires
+   automatically at your real account is the last place to accept code nobody
+   tested.
+
+A safer shape that keeps the speed: have the script **notify you instantly**
+— a phone push takes under a second — and claim by hand. The window on a freed
+handle is usually minutes, not milliseconds, and you keep your credentials and
+your account.
+
 ## RPS is not evidence that anything is working
 
 The request rate counts requests **sent**, not answers received — and that
