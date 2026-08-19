@@ -361,3 +361,43 @@ func TestRetryAfterIsNotCarried(t *testing.T) {
 		t.Errorf("429 read as %s retryable=%v", status, retryable)
 	}
 }
+
+// Bounding the dial at -timeout looks right and is wrong. Opening a connection
+// is a one-off cost amortised over every request that reuses it, so somebody
+// running -timeout 2s for speed is saying what a CHECK may cost, not what
+// reaching a proxy on another continent may cost. Held to 2s, a proxy that
+// needs three seconds to connect and then answers in 300ms never connects at
+// all - and the entire run comes back as timeouts.
+func TestShortTimeoutDoesNotStrangleTheDial(t *testing.T) {
+	cases := []struct {
+		timeout time.Duration
+		want    time.Duration
+	}{
+		{0, 0},                               // -timeout 0 means no bound anywhere
+		{2 * time.Second, minDialTimeout},    // the speed-chasing case
+		{10 * time.Second, minDialTimeout},   // the default
+		{30 * time.Second, 30 * time.Second}, // generous timeouts are honoured
+	}
+	for _, c := range cases {
+		if got := dialBound(c.timeout); got != c.want {
+			t.Errorf("dialBound(%v) = %v, want %v", c.timeout, got, c.want)
+		}
+	}
+
+	// And it has to reach the transport that is actually built.
+	cache := newClientCacheFor(2*time.Second, 10, 1)
+	spec, err := parseProxy("http://127.0.0.1:8080")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cl, err := cache.clientFor(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cl.Timeout != 2*time.Second {
+		t.Errorf("request timeout is %v, want 2s - the run's own deadline must not move", cl.Timeout)
+	}
+	if tr := cl.Transport.(*http.Transport); tr.DialContext == nil {
+		t.Error("DialContext is nil")
+	}
+}

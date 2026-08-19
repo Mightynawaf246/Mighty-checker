@@ -666,7 +666,7 @@ func (c *clientCache) clientFor(p *proxySpec) (*http.Client, error) {
 	// one, and nothing caps how many pile up. The SOCKS paths below have always
 	// bounded their own dials for exactly this reason; HTTP and direct
 	// connections were the ones left unguarded.
-	dialer := &net.Dialer{Timeout: c.timeout, KeepAlive: 30 * time.Second}
+	dialer := &net.Dialer{Timeout: dialBound(c.timeout), KeepAlive: 30 * time.Second}
 
 	switch {
 	case p == nil:
@@ -730,6 +730,32 @@ func (c *clientCache) clientFor(p *proxySpec) (*http.Client, error) {
 	return cl, nil
 }
 
+// minDialTimeout is the floor under the dial bound.
+//
+// A dial is not a request. Opening the connection - TCP, then the proxy's own
+// negotiation, then TLS to the endpoint - is a one-off cost paid once and then
+// amortised over every request that reuses the connection, so holding it to a
+// single request's deadline is the wrong comparison. Somebody running
+// -timeout 2s to keep the rate high is saying what a CHECK may cost, not what
+// opening a socket to a proxy on another continent may cost, and a proxy that
+// needs three seconds to connect and then answers in 300ms is a perfectly good
+// proxy. Bounding the dial at 2s there turns it into a proxy that never
+// connects at all, and the whole run comes back as timeouts.
+const minDialTimeout = 15 * time.Second
+
+// dialBound is how long a dial may take: the run's timeout, but never so short
+// that a usable proxy cannot finish connecting. Zero means no bound, matching
+// -timeout 0.
+func dialBound(timeout time.Duration) time.Duration {
+	if timeout <= 0 {
+		return 0
+	}
+	if timeout < minDialTimeout {
+		return minDialTimeout
+	}
+	return timeout
+}
+
 // dialContext bounds a dial with the run's configured timeout.
 //
 // This has to be done here rather than relying on the request context, because
@@ -740,6 +766,7 @@ func (c *clientCache) clientFor(p *proxySpec) (*http.Client, error) {
 // bound of our own, a proxy that accepts TCP and then goes silent occupies a
 // goroutine and a socket until some unrelated default expires.
 func dialContext(ctx context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
+	timeout = dialBound(timeout)
 	if timeout <= 0 {
 		return ctx, func() {}
 	}
