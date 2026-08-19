@@ -8,6 +8,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -32,6 +33,12 @@ type hookRunner struct {
 	command string
 	con     *console
 
+	// action, when set, replaces running an external command: it is called
+	// with the name and returns a line to log plus an error. The built-in
+	// claimer plugs in here, so it inherits the once-per-name, bounded,
+	// off-the-writer, survives-Ctrl-C machinery for free.
+	action func(context.Context, string) (string, error)
+
 	// Hits arrive in bursts and each one starts a process. A few at a time is
 	// plenty and keeps a run that suddenly finds two hundred names from forking
 	// two hundred processes at once.
@@ -43,6 +50,14 @@ type hookRunner struct {
 	// is at best wasted and at worst two conflicting writes to an account.
 	mu    sync.Mutex
 	fired map[string]bool
+
+	// Live counters for the status line, so the operator can see the claimer
+	// working rather than trusting that it is. active is how many claims are
+	// running right now; done and failed are totals.
+	active   atomic.Int64
+	done     atomic.Int64
+	failed   atomic.Int64
+	lastName atomic.Value // string: the name most recently handed to a claim
 }
 
 const (
@@ -53,6 +68,22 @@ const (
 	// hookSlots is how many may run at once.
 	hookConcurrency = 4
 )
+
+// newActionRunner wraps an in-process action with the same guarantees the
+// external-command runner gives: once per name, at most hookConcurrency at a
+// time, off the writer's goroutine, and never killed just because the sweep is
+// ending.
+func newActionRunner(action func(context.Context, string) (string, error), con *console) *hookRunner {
+	if action == nil {
+		return nil
+	}
+	return &hookRunner{
+		action: action,
+		con:    con,
+		slots:  make(chan struct{}, hookConcurrency),
+		fired:  make(map[string]bool),
+	}
+}
 
 func newHookRunner(command string, con *console) *hookRunner {
 	if strings.TrimSpace(command) == "" {
@@ -96,11 +127,33 @@ func (h *hookRunner) fire(ctx context.Context, name string) {
 }
 
 func (h *hookRunner) run(name string) {
+	h.lastName.Store(name)
+	h.active.Add(1)
+	failed := false
+	defer func() {
+		h.active.Add(-1)
+		h.done.Add(1)
+		if failed {
+			h.failed.Add(1)
+		}
+	}()
+
 	// context.Background, not the run's context: a hit found in the last second
 	// before Ctrl-C is exactly the one worth acting on, and cancelling the claim
 	// because the sweep is stopping would throw it away.
 	ctx, cancel := context.WithTimeout(context.Background(), hookTimeout)
 	defer cancel()
+
+	if h.action != nil {
+		msg, err := h.action(ctx, name)
+		if err != nil {
+			failed = true
+			h.con.log(cRed("  ! claim @" + name + " failed: " + err.Error()))
+		} else if msg != "" {
+			h.con.log(cGreen("  ! " + msg))
+		}
+		return
+	}
 
 	cmd := hookCommand(ctx, h.command, name)
 	cmd.Env = append(os.Environ(), "MIGHTY_USERNAME="+name)
@@ -111,8 +164,10 @@ func (h *hookRunner) run(name string) {
 
 	switch {
 	case ctx.Err() != nil:
+		failed = true
 		h.con.log(cRed(fmt.Sprintf("  ! hook for @%s timed out after %v", name, hookTimeout)))
 	case err != nil:
+		failed = true
 		h.con.log(cRed(fmt.Sprintf("  ! hook for @%s failed after %v: %v", name, took, err)))
 	default:
 		h.con.log(cGreen(fmt.Sprintf("  ! hook for @%s ran in %v", name, took)))
@@ -122,6 +177,19 @@ func (h *hookRunner) run(name string) {
 			h.con.log(cGray("      " + strings.TrimRight(line, "\r")))
 		}
 	}
+}
+
+// claimStats reports live claim activity for the status line: how many are
+// running now, how many finished, how many failed, and the name most recently
+// worked on. Safe to call from the writer goroutine while claims run.
+func (h *hookRunner) claimStats() (active, done, failed int, last string) {
+	if h == nil {
+		return 0, 0, 0, ""
+	}
+	if v, ok := h.lastName.Load().(string); ok {
+		last = v
+	}
+	return int(h.active.Load()), int(h.done.Load()), int(h.failed.Load()), last
 }
 
 // stop waits for anything still running. A claim in flight when the sweep ends

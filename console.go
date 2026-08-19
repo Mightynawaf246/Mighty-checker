@@ -254,6 +254,14 @@ type statusView struct {
 	// reports a higher rate than a healthy one. Without this the screen says
 	// 445 requests a second while every single one of them is failing.
 	FailPct int
+
+	// Claim activity, shown only when an -on-available claimer is wired up, so
+	// the operator can watch it working - "is the auto-claimer actually firing"
+	// is the first thing they want to see, right next to the rate.
+	ClaimActive int    // claims running right now
+	ClaimDone   int    // claims finished (success or fail)
+	ClaimFail   int    // of those, how many failed
+	Claiming    string // the handle a claim is working on right now
 }
 
 // buildStatus renders the colored status line in the original panel style.
@@ -330,6 +338,24 @@ func buildStatus(name string, v statusView) string {
 		line += seg("Left", fmt.Sprintf("%d", v.Left)) + sep
 		if v.Passes > 0 {
 			line += cGray("x") + cPurple(fmt.Sprintf("%d", v.Passes)) + sep
+		}
+	}
+
+	// The claimer, when one is wired up. While a claim is running, show the
+	// handle it is fighting for in green; between claims show the running total
+	// so the operator knows it fired. This is the line the user watches to know
+	// the auto-claimer is alive.
+	if v.ClaimActive > 0 || v.ClaimDone > 0 {
+		if v.ClaimActive > 0 && v.Claiming != "" {
+			line += cGray("CLAIM ") + cGreen("@"+v.Claiming) +
+				cGray(fmt.Sprintf(" (%d active)", v.ClaimActive)) + sep
+		} else {
+			got := v.ClaimDone - v.ClaimFail
+			line += cGray("CLAIM ") + cGreen(fmt.Sprintf("%d done", got))
+			if v.ClaimFail > 0 {
+				line += cRed(fmt.Sprintf("/%d failed", v.ClaimFail))
+			}
+			line += sep
 		}
 	}
 

@@ -174,3 +174,91 @@ func TestHookPassesTheNameAsAnArgumentNotAsText(t *testing.T) {
 		t.Errorf("the name is not among the arguments: %v", cmd.Args)
 	}
 }
+
+// The operator watches the status line to know the auto-claimer is alive. So
+// the runner has to expose live activity: what is running now, what finished,
+// and the handle it is working on.
+func TestClaimStatsTrackActivity(t *testing.T) {
+	skipOnWindows(t)
+
+	a, d, f, last := (*hookRunner)(nil).claimStats()
+	if a != 0 || d != 0 || f != 0 || last != "" {
+		t.Fatal("a nil runner should report no activity")
+	}
+
+	dir := t.TempDir()
+	gate := filepath.Join(dir, "gate")
+	// The claim blocks until the gate file appears, so the test can observe it
+	// mid-flight.
+	h := newHookRunner(fmt.Sprintf(`until [ -f %s ]; do sleep 0.02; done`, gate), nil)
+
+	h.fire(context.Background(), "wantedhandle")
+
+	// Wait for it to be counted as running.
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if a, _, _, last := h.claimStats(); a == 1 && last == "wantedhandle" {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	a, _, _, last = h.claimStats()
+	if a != 1 {
+		t.Fatalf("a running claim is not shown as active (active=%d)", a)
+	}
+	if last != "wantedhandle" {
+		t.Errorf("the handle being claimed is not exposed: %q", last)
+	}
+
+	// Release it and let it finish.
+	os.WriteFile(gate, []byte("go"), 0o644)
+	h.stop()
+
+	a, d, f, _ = h.claimStats()
+	if a != 0 {
+		t.Errorf("active=%d after finishing, want 0", a)
+	}
+	if d != 1 {
+		t.Errorf("done=%d, want 1", d)
+	}
+	if f != 0 {
+		t.Errorf("failed=%d for a clean claim, want 0", f)
+	}
+}
+
+// A failing claim is counted as failed, so the status line can show it in red.
+func TestClaimStatsCountFailures(t *testing.T) {
+	skipOnWindows(t)
+	h := newHookRunner("exit 1", nil)
+	h.fire(context.Background(), "handle")
+	h.stop()
+	_, d, f, _ := h.claimStats()
+	if d != 1 || f != 1 {
+		t.Errorf("done=%d failed=%d, want 1/1 for a command that exits non-zero", d, f)
+	}
+}
+
+// The status line must render the claim segment: the handle while active, the
+// total when idle.
+func TestStatusLineShowsClaimActivity(t *testing.T) {
+	// Actively claiming: the handle is shown.
+	active := buildStatus("Mighty", statusView{RPS: 300, ClaimActive: 1, Claiming: "wanted"})
+	if !strings.Contains(active, "CLAIM") || !strings.Contains(active, "@wanted") {
+		t.Errorf("an active claim is not shown on the status line: %q", active)
+	}
+
+	// Idle but some done: the total is shown.
+	idle := buildStatus("Mighty", statusView{RPS: 300, ClaimDone: 3, ClaimFail: 1})
+	if !strings.Contains(idle, "CLAIM") || !strings.Contains(idle, "2 done") {
+		t.Errorf("finished claims are not summarised: %q", idle)
+	}
+	if !strings.Contains(idle, "1 failed") {
+		t.Errorf("failed claims are not shown: %q", idle)
+	}
+
+	// No claimer wired up: no CLAIM segment at all.
+	none := buildStatus("Mighty", statusView{RPS: 300})
+	if strings.Contains(none, "CLAIM") {
+		t.Errorf("a run with no claimer should not show a CLAIM segment: %q", none)
+	}
+}

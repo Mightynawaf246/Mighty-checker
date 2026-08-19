@@ -389,6 +389,29 @@ So `available.txt` is a list of names the endpoint says nothing is registered
 under. That is the strongest signal this endpoint can give, and it is not a
 promise. No checker built on it can do better.
 
+## Watching the claimer work
+
+When `-on-available` is set, the live status line shows the claimer working,
+right next to the rate - so "is the auto-claimer actually firing" is answered at
+a glance instead of taken on faith.
+
+While a claim is running, the handle it is fighting for is shown in green:
+
+```
+ [ Mighty ] RPS 4821 │ UPS 4820 │ Att 128944 │ CUS 750 │ LAT 138ms │ PX 75/75 │ Left 3 │ CLAIM @zzwanted01 (1 active) │ A 2 │ ...
+```
+
+Between claims it shows the running total, so you know it fired even if you
+looked away:
+
+```
+ ... │ CLAIM 2 done │ A 2 │ ...
+ ... │ CLAIM 2 done/1 failed │ A 2 │ ...   (when some claims failed)
+```
+
+The segment appears only when a claimer is wired up. `RPS`, `Att`, `CUS`, `LAT`
+and the rest keep meaning exactly what they did.
+
 ## Acting on a hit: `-on-available`
 
 A hit is worth nothing until something acts on it. Everything upstream of the

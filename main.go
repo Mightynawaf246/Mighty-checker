@@ -1527,23 +1527,28 @@ func runWriter(ctx context.Context, results <-chan result, cfg *config, con *con
 		lastAttempts, lastFailures = attempts, failNow
 
 		left := wl.size()
+		claimActive, claimDone, claimFail, claiming := onHit.claimStats()
 		con.status(buildStatus(appName, statusView{
-			Loop:       cfg.loop,
-			Passes:     wl.passCount(),
-			RPS:        rps,
-			UPS:        ups,
-			Attempts:   attempts,
-			Checked:    checked,
-			Left:       left,
-			Counts:     counts,
-			Elapsed:    now.Sub(start),
-			Cus:        effectiveConcurrency(lim, usefulConcurrency(cfg.threads, left, cfg.loop)),
-			Latency:    lat,
-			Fresh:      freshness(lat, left, ups),
-			Threads:    cfg.threads,
-			ProxiesOK:  pool.healthy(),
-			ProxiesAll: pool.len(),
-			FailPct:    failPct,
+			Loop:        cfg.loop,
+			Passes:      wl.passCount(),
+			RPS:         rps,
+			UPS:         ups,
+			Attempts:    attempts,
+			Checked:     checked,
+			Left:        left,
+			Counts:      counts,
+			Elapsed:     now.Sub(start),
+			Cus:         effectiveConcurrency(lim, usefulConcurrency(cfg.threads, left, cfg.loop)),
+			Latency:     lat,
+			Fresh:       freshness(lat, left, ups),
+			Threads:     cfg.threads,
+			ProxiesOK:   pool.healthy(),
+			ProxiesAll:  pool.len(),
+			FailPct:     failPct,
+			ClaimActive: claimActive,
+			ClaimDone:   claimDone,
+			ClaimFail:   claimFail,
+			Claiming:    claiming,
 		}))
 	}
 
