@@ -49,6 +49,8 @@ type config struct {
 	noProxyCheck     bool
 	checkProxiesOnly bool
 	keepDeadProxies  bool
+	noSelfTest       bool
+	selfTestOnly     bool
 	targetRPS        int
 	perProxy         int
 }
@@ -388,7 +390,7 @@ func main() {
 	// Testing proxies needs no usernames, so do not demand a list for it. This
 	// is the one command someone runs before their list is ready.
 	var usernames []string
-	if !cfg.checkProxiesOnly {
+	if !cfg.checkProxiesOnly && !cfg.selfTestOnly {
 		var err error
 		usernames, err = loadLines(cfg.usernamesFile)
 		if err != nil {
@@ -522,6 +524,46 @@ func main() {
 		lim.setCeiling(pool.healthy() * cfg.perProxy)
 	}
 
+	if cfg.selfTestOnly {
+		fmt.Println(" " + label(appName+" Self Test") + " " + cGray("v"+appVersion()))
+		g := newContractGuard(cfg, pool, cache, lim, newConsole(cfg))
+		v := g.runStartupCheck(ctx)
+		fmt.Println()
+		switch {
+		case v.ok:
+			fmt.Println("  " + cGreen("the endpoint still answers the way this tool reads it."))
+			return
+		case v.fatal:
+			fmt.Println("  " + cRed("do not run: results would be wrong in the direction that destroys your list."))
+			os.Exit(1)
+		default:
+			fmt.Println("  " + cYellow("could not prove the contract either way - try again, or with better proxies."))
+			os.Exit(2)
+		}
+	}
+
+	// Before touching a single name of the user's list, ask the endpoint
+	// something whose answer is already known. Everything downstream - the
+	// results files, the deletions from the usernames file - rests on the
+	// classifier reading the endpoint correctly, and that is an assumption that
+	// can stop being true without warning.
+	guard := newContractGuard(cfg, pool, cache, lim, newConsole(cfg))
+	if !cfg.noSelfTest {
+		v := guard.runStartupCheck(ctx)
+		switch {
+		case v.fatal:
+			fmt.Println()
+			fatalf("refusing to run: the endpoint is not answering the way this tool " +
+				"reads it. Running anyway would fill available.txt with names that are " +
+				"not free and delete them from your list. Update the tool, or use " +
+				"-no-self-test to override (results will be wrong).")
+		case !v.ok && ctx.Err() == nil:
+			fmt.Println()
+			warnf("the self test could not prove the endpoint is answering correctly - " +
+				"treat this run's results with suspicion")
+		}
+	}
+
 	sink := newResultSink(cfg)
 	defer sink.close()
 
@@ -551,7 +593,15 @@ func main() {
 		go watchList(ctx, cfg, wl, selfWrites)
 	}
 
-	counts := runPipeline(ctx, wl, pool, cache, cfg, sink, stats, lim, pruner, start, con)
+	// Keep testing while the run lasts: a doc_id can be rotated an hour in, and
+	// a check that ran only at startup proved only that the start was sound.
+	runCtx, halt := context.WithCancel(ctx)
+	if !cfg.noSelfTest {
+		go guard.watch(runCtx, func(string) { wl.close(); halt() })
+	}
+
+	counts := runPipeline(runCtx, wl, pool, cache, cfg, sink, stats, lim, pruner, start, con)
+	halt()
 	pruner.stop()
 	sink.flush()
 
@@ -1893,6 +1943,10 @@ func parseFlags() *config {
 		"test the proxies, print the report, and exit")
 	flag.BoolVar(&cfg.keepDeadProxies, "keep-dead-proxies", false,
 		"leave proxies that failed the test in the proxies file")
+	flag.BoolVar(&cfg.noSelfTest, "no-self-test", false,
+		"skip the endpoint contract check (results may be silently wrong)")
+	flag.BoolVar(&cfg.selfTestOnly, "self-test", false,
+		"check that the endpoint still answers as this tool reads it, then exit")
 	flag.IntVar(&cfg.targetRPS, "target", 0,
 		"aim for this many requests per second; sets -t from the measured latency")
 	flag.IntVar(&cfg.perProxy, "per-proxy", defaultPerProxy,
@@ -1921,6 +1975,8 @@ options:
   -no-confirm           report available names without a confirming re-check
   -no-adapt             disable adaptive concurrency (drive threads flat out)
   -http2                use HTTP/2 (one connection per host, far less parallel)
+  -self-test            verify the endpoint contract and exit
+  -no-self-test         skip the contract check (results may be wrong)
   -check-proxies        test the proxies, print the report, and exit
   -keep-dead-proxies    leave dead proxies in the list (they are moved to
                         proxies-dead.txt by default)

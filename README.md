@@ -312,6 +312,83 @@ limiter, so `-no-adapt` switches it off along with everything else. Under
   Capacity : 10 per proxy - NOT enforced, -no-adapt drives all 2089 threads regardless
 ```
 
+## The self test: does the endpoint still mean what we think it means?
+
+This tool rests on an endpoint nobody documents. `doc_id 25391252800555418` and
+the query it names are Meta's internal plumbing, not a published API, and Meta
+owes nobody notice before changing either. When they do, the tool does not
+stop — it carries on answering, wrongly, at thousands of names a second.
+
+Two shapes of that are possible and they are not equally bad:
+
+- **Everything reads unknown.** Annoying, visible, harmless: nothing is written
+  and nothing is deleted.
+- **Everything reads available.** This one is unrecoverable. An available
+  verdict writes the name to `available.txt` *and deletes it from your list*, so
+  it is never checked again. A drift of the shape "`status: success` now means
+  the request succeeded, not that the name is free" would empty a ten-million-name
+  list into a garbage results file in minutes — and the screen would look like
+  the best run in the tool's history.
+
+No care in the classifier prevents that, because the classifier would be reading
+the new contract correctly and drawing the old conclusion. The only defence is to
+ask the endpoint something whose answer is already known.
+
+So before a single name of your list is touched:
+
+```
+ [ Self Test ] asking the endpoint what we already know
+  Contract : intact
+  Checked  : @instagram, @nasa, @nike and 2 names that cannot exist
+```
+
+Accounts that certainly exist must come back **taken**; random 24-character
+strings, which nothing is registered under, must come back **available**. Get
+either wrong and the run does not start:
+
+```
+  Contract : BROKEN
+  Problem  : the endpoint reported a name that certainly exists as AVAILABLE
+  Meaning  : @instagram, @nasa, @nike came back available. Every available
+             verdict this run would be false, and each one deletes a name from
+             your list permanently.
+
+[x] refusing to run
+```
+
+Measured against an endpoint that answers SUCCESS to everything, on a 500-name
+list:
+
+| | names left in the list | written to available.txt |
+|---|---|---|
+| with the self test | **500 — untouched** | **0** |
+| `-no-self-test` | **1** | **500 false hits** |
+
+The test repeats every ten minutes during the run, because a doc_id can be
+rotated an hour into a sweep and a check that ran only at startup proves only
+that the start was sound. A mid-run failure stops the run rather than logging
+and carrying on. It survives any one of the canary accounts being renamed some
+day, and its traffic is kept out of your own counters.
+
+Run it on its own with `-self-test`. Skip it with `-no-self-test`, which is
+there for the case where you know better than the tool does — results may be
+silently wrong.
+
+### What the self test cannot tell you
+
+The endpoint answers "is this name free to register *right now, in the signup
+form*". That is not quite "can I have this name":
+
+- A deleted account holds its username for **30 days**, and Instagram gives no
+  guarantee on the exact timing after that.
+- Short and high-value handles are held back longer, and handles from accounts
+  removed for violations may be **permanently retired** — the endpoint can report
+  them free and registration will still refuse.
+
+So `available.txt` is a list of names the endpoint says nothing is registered
+under. That is the strongest signal this endpoint can give, and it is not a
+promise. No checker built on it can do better.
+
 ## Dead proxies are moved, not deleted
 
 A proxy the pre-flight proves dead leaves the live list and lands in
