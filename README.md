@@ -389,6 +389,42 @@ So `available.txt` is a list of names the endpoint says nothing is registered
 under. That is the strongest signal this endpoint can give, and it is not a
 promise. No checker built on it can do better.
 
+## RPS is not evidence that anything is working
+
+The request rate counts requests **sent**, not answers received — and that
+matters more than it sounds, because a refused connection comes back *faster*
+than a real answer. A pool that has gone completely dead therefore reports a
+**higher** rate than a healthy one.
+
+Measured: ten dead proxies, three thousand names, every single request failing.
+
+```
+  Errors   : 3000
+  Speed    : 74 names/sec  (445 requests/sec)
+```
+
+445 requests a second, and not one of them reached Instagram. Nothing about the
+number is false — the tool really did send 445 requests a second — and anybody
+watching the live line would have concluded the run was going well.
+
+So the line now says what share of those requests came back with nothing:
+
+```
+ [ Mighty ] RPS 445 │ UPS 74 │ LAT 22ms │ FAIL 100% │ ...
+```
+
+`RPS` turns red past half, `FAIL` appears past ten percent, and a few percent is
+left alone — flagging the ordinary case would only train you to ignore it. The
+summary carries the same reading:
+
+```
+  Speed    : 71 names/sec  (426 requests/sec)  - 100% of those requests got no answer at all
+```
+
+**The number to trust is UPS, not RPS.** RPS is the load you are putting on the
+endpoint; UPS is names actually resolved. When they diverge, the gap is retries
+and failures.
+
 ## The worst kind of proxy is the one that answers
 
 A dead proxy is easy: it times out, you see errors, you replace it. The

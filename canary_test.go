@@ -286,3 +286,41 @@ func TestProbeAndCanaryNamesLookOrdinary(t *testing.T) {
 			"'names of that shape are refused'")
 	}
 }
+
+// The request rate is highest exactly when nothing is working: a refused
+// connection comes back faster than a real answer, so a pool that has gone
+// completely dead reports a HIGHER rate than a healthy one. Measured on a real
+// run: ten dead proxies, three thousand errors, 445 requests/sec on screen and
+// nothing anywhere saying the number was all failures.
+func TestStatusLineAdmitsWhenEveryRequestIsFailing(t *testing.T) {
+	base := statusView{RPS: 445, UPS: 74, Attempts: 3000, Checked: 3000, Threads: 200, Cus: 10}
+
+	healthy := buildStatus("Mighty", base)
+	if strings.Contains(healthy, "FAIL") {
+		t.Error("a run with no failures should not carry a FAIL reading")
+	}
+
+	dying := base
+	dying.FailPct = 100
+	broken := buildStatus("Mighty", dying)
+	if !strings.Contains(broken, "FAIL") {
+		t.Fatal("every request failing, and the line still reads as pure throughput")
+	}
+	if !strings.Contains(broken, "100%") {
+		t.Error("the share of failing requests is not shown")
+	}
+
+	// A trickle is ordinary and must not cry wolf.
+	minor := base
+	minor.FailPct = 4
+	if strings.Contains(buildStatus("Mighty", minor), "FAIL") {
+		t.Error("4% failures is ordinary; flagging it would train the user to ignore it")
+	}
+
+	// A third failing is worth saying.
+	some := base
+	some.FailPct = 35
+	if !strings.Contains(buildStatus("Mighty", some), "FAIL") {
+		t.Error("35% of requests getting no answer went unreported")
+	}
+}

@@ -244,6 +244,16 @@ type statusView struct {
 
 	ProxiesOK  int // proxies not currently quarantined
 	ProxiesAll int // proxies loaded
+
+	// FailPct is the share of the requests just sent that came back with
+	// nothing at all, over the same window as the rates.
+	//
+	// Shown because RPS on its own is not evidence that anything is working,
+	// and is highest exactly when it is not: a refused connection returns
+	// faster than a real answer, so a pool that has gone completely dead
+	// reports a higher rate than a healthy one. Without this the screen says
+	// 445 requests a second while every single one of them is failing.
+	FailPct int
 }
 
 // buildStatus renders the colored status line in the original panel style.
@@ -265,8 +275,16 @@ func buildStatus(name string, v statusView) string {
 		progress = fmt.Sprintf("%d/%d %d%%", v.Checked, total, v.Checked*100/total)
 	}
 
+	// Once most requests are coming back with nothing, the rate is measuring
+	// how fast the failures arrive. Say so on the number itself, rather than
+	// leaving it to look like throughput.
+	rps := cCyan(fmt.Sprintf("%d", v.RPS))
+	if v.FailPct >= 50 {
+		rps = cRed(fmt.Sprintf("%d", v.RPS))
+	}
+
 	line := head + " " +
-		seg("RPS", fmt.Sprintf("%d", v.RPS)) + sep +
+		cGray("RPS ") + rps + sep +
 		seg("UPS", fmt.Sprintf("%d", v.UPS)) + sep +
 		seg("Att", fmt.Sprintf("%d", v.Attempts)) + sep +
 		seg("Chk", progress) + sep
@@ -283,6 +301,15 @@ func buildStatus(name string, v statusView) string {
 	}
 	if v.Latency > 0 {
 		line += seg("LAT", v.Latency.Round(time.Millisecond).String()) + sep
+	}
+	// Only when it is worth saying. A few percent is ordinary; a third is a
+	// problem, and the whole run being failures must never look like throughput.
+	if v.FailPct >= 10 {
+		fail := cYellow(fmt.Sprintf("%d%%", v.FailPct))
+		if v.FailPct >= 50 {
+			fail = cRed(fmt.Sprintf("%d%%", v.FailPct))
+		}
+		line += cGray("FAIL ") + fail + sep
 	}
 	if v.Loop && v.Fresh > 0 {
 		line += seg("FRESH", v.Fresh.Round(time.Millisecond).String()) + sep

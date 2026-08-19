@@ -74,6 +74,18 @@ type liveStats struct {
 	// path that runs tens of thousands of times a second.
 	latencyNanos atomic.Int64
 	latencyCount atomic.Int64
+
+	// failures counts requests that never got an answer at all - the proxy
+	// refused, timed out, or dropped the connection.
+	//
+	// Kept because the request rate on its own is not evidence that anything is
+	// working, and reads highest exactly when it is not. A refused connection
+	// comes back faster than a real answer, so a pool that has gone completely
+	// dead produces a HIGHER number than a healthy one: measured, ten dead
+	// proxies and three thousand errors reported 445 requests/sec. Nothing
+	// about that number is false - it really did send 445 requests a second -
+	// and somebody watching it would conclude the run was going well.
+	failures atomic.Int64
 }
 
 // observeLatency records one completed round trip.
@@ -970,7 +982,25 @@ func printSummary(cfg *config, counts tally, elapsed time.Duration, interrupted 
 		attempts := stats.attempts.Load()
 		ups := float64(counts.total()) / secs
 		rps := float64(attempts) / secs
-		row("Speed", cCyan(fmt.Sprintf("%.0f names/sec  (%.0f requests/sec)", ups, rps)))
+		// The request rate on its own is not evidence that anything worked. A
+		// refused connection comes back faster than a real answer, so a run
+		// whose pool was entirely dead reports a HIGHER rate than a healthy
+		// one - measured, 445 requests/sec with three thousand errors and not
+		// one answer. Say what share of it landed.
+		if failed := stats.failures.Load(); failed > 0 && attempts > 0 {
+			pct := int(failed * 100 / attempts)
+			text := fmt.Sprintf("%.0f names/sec  (%.0f requests/sec)", ups, rps)
+			switch {
+			case pct >= 50:
+				row("Speed", cRed(text)+cRed(fmt.Sprintf("  - %d%% of those requests got no answer at all", pct)))
+			case pct >= 10:
+				row("Speed", cCyan(text)+cYellow(fmt.Sprintf("  - %d%% got no answer", pct)))
+			default:
+				row("Speed", cCyan(text))
+			}
+		} else {
+			row("Speed", cCyan(fmt.Sprintf("%.0f names/sec  (%.0f requests/sec)", ups, rps)))
+		}
 
 		// Latency, measured rather than derived. Together with the concurrency
 		// these are the rate, so a run that disappointed can be read directly:
@@ -1182,6 +1212,9 @@ func attemptOnce(ctx context.Context, username string, pool *proxyPool,
 	if err != nil {
 		// A transport failure is the proxy's fault, not the endpoint's, so it
 		// counts against proxy health but is not a throttle signal.
+		if stats != nil {
+			stats.failures.Add(1)
+		}
 		pool.markFail(p)
 		out.err = err
 		return out
@@ -1433,6 +1466,7 @@ func runWriter(ctx context.Context, results <-chan result, cfg *config, con *con
 	rpsWin.add(seededAt, float64(stats.attempts.Load()))
 	upsWin.add(seededAt, 0)
 	lastLatNanos, lastLatCount := stats.latencyNanos.Load(), stats.latencyCount.Load()
+	lastAttempts, lastFailures := stats.attempts.Load(), stats.failures.Load()
 
 	refresh := func() {
 		now := time.Now()
@@ -1468,6 +1502,17 @@ func runWriter(ctx context.Context, results <-chan result, cfg *config, con *con
 		}
 		lastLatNanos, lastLatCount = sumNow, cntNow
 
+		// What share of the requests just sent came back with nothing. Over the
+		// same trailing window as the rates, so it moves with them rather than
+		// averaging over the whole run and hiding a pool that died five minutes
+		// ago.
+		failPct := 0
+		failNow := stats.failures.Load()
+		if d := attempts - lastAttempts; d > 0 {
+			failPct = int((failNow - lastFailures) * 100 / d)
+		}
+		lastAttempts, lastFailures = attempts, failNow
+
 		left := wl.size()
 		con.status(buildStatus(appName, statusView{
 			Loop:       cfg.loop,
@@ -1485,6 +1530,7 @@ func runWriter(ctx context.Context, results <-chan result, cfg *config, con *con
 			Threads:    cfg.threads,
 			ProxiesOK:  pool.healthy(),
 			ProxiesAll: pool.len(),
+			FailPct:    failPct,
 		}))
 	}
 
