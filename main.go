@@ -48,7 +48,7 @@ type config struct {
 
 	noProxyCheck     bool
 	checkProxiesOnly bool
-	pruneProxies     bool
+	keepDeadProxies  bool
 	targetRPS        int
 	perProxy         int
 }
@@ -303,6 +303,15 @@ const (
 	// stop being resilience and become repetition against the same rate limit.
 	maxRetries = 10
 
+	// transportRetries is how many dropped connections a single name may absorb
+	// before the tool gives up and calls it an error.
+	//
+	// Separate from -retries because the two count different things. -retries
+	// is how many times to ASK about a name; this is how many times a proxy may
+	// fail to carry the question at all. Spending the first budget on the
+	// second is what turned answerable names into errors under load.
+	transportRetries = 4
+
 	// defaultPerProxy is how many checks may be in flight through one proxy.
 	//
 	// A proxy is a machine with a connection limit of its own, and past it
@@ -453,13 +462,25 @@ func main() {
 		alive := printProxyReport(cfg, reports)
 		pre.closeIdle()
 
-		if cfg.pruneProxies {
-			kept, err := pruneProxies(cfg.proxiesFile, reports)
+		// Dead proxies are MOVED, not deleted: written to their own file with
+		// the reason they failed, then taken out of the live list. Keeping them
+		// in the rotation costs a slot and a timeout on every pass; deleting
+		// them outright throws away something the user paid for and may want to
+		// take back to their provider.
+		if !cfg.keepDeadProxies {
+			moved, err := writeDeadProxies(cfg, reports)
 			if err != nil {
-				warnf("cannot prune %s: %v", cfg.proxiesFile, err)
-			} else {
-				fmt.Println("  " + cGreen(fmt.Sprintf("pruned %s - %d working proxies kept",
-					cfg.proxiesFile, kept)))
+				warnf("cannot write %s: %v", outPath(cfg, deadProxiesFile), err)
+			} else if moved > 0 {
+				kept, err := pruneProxies(cfg.proxiesFile, reports)
+				if err != nil {
+					warnf("cannot update %s: %v", cfg.proxiesFile, err)
+				} else {
+					fmt.Println()
+					fmt.Printf("  %s %s\n",
+						cGreen(fmt.Sprintf("moved %d dead proxies to %s", moved, outPath(cfg, deadProxiesFile))),
+						cGray(fmt.Sprintf("- %d left in %s", kept, cfg.proxiesFile)))
+				}
 			}
 		}
 		if cfg.checkProxiesOnly {
@@ -1162,6 +1183,18 @@ func attemptOnce(ctx context.Context, username string, pool *proxyPool,
 //     with one proxy, with none, or once all but one were quarantined, the
 //     second opinion came from the same connection as the first — which is
 //     worthless, since a soft-blocked proxy returns the same wrong body twice.
+//
+//   - A connection that never completed is not an attempt at the name. It is
+//     the proxy having a bad moment, and it used to consume one of only two
+//     tries and then, twice over, report a perfectly answerable name as an
+//     error. Measured against a proxy that drops connections past its
+//     concurrency limit - which is what a real one does under load rather than
+//     queueing politely - 39% of names came back as errors at -t 200 and 46% at
+//     -t 800. Every one of them was a name the endpoint would have answered.
+//
+//     So transport failures draw on their own allowance, and each retry
+//     deliberately steps to a different proxy: the one that just dropped the
+//     connection is the least likely of the pool to answer the next one.
 func checkWithRetries(ctx context.Context, username string, pool *proxyPool,
 	cache *clientCache, cfg *config, stats *liveStats, lim *adaptiveLimiter) result {
 
@@ -1177,19 +1210,38 @@ func checkWithRetries(ctx context.Context, username string, pool *proxyPool,
 		attempts = 2
 	}
 
-	for attempt := 0; attempt < attempts; attempt++ {
+	// answers counts only the tries that produced a response. Dropped
+	// connections are counted separately, against transportRetries, so a rough
+	// patch on the pool cannot exhaust the budget for actually asking.
+	answers := 0
+	avoid := ""
+
+	for try := 0; try < attempts+transportRetries && answers < attempts; try++ {
 		if ctx.Err() != nil {
 			break
 		}
 
-		out := attemptOnce(ctx, username, pool, cache, cfg, stats, lim, "")
+		out := attemptOnce(ctx, username, pool, cache, cfg, stats, lim, avoid)
+		// Whatever happened, the next try should ask somebody else.
+		avoid = ""
+		if out.spec != nil {
+			avoid = out.spec.key()
+		}
+
 		if out.err != nil {
 			lastErr = out.err
 			lastErrProxy = out.proxy
 			last.proxy = out.proxy
+			// A pause, so a pool-wide wobble is not answered with a burst that
+			// prolongs it. Short, because the remedy is the next proxy.
+			select {
+			case <-time.After(retryPause(try)):
+			case <-ctx.Done():
+			}
 			continue
 		}
 
+		answers++
 		sawResponse = true
 		last = out
 
@@ -1246,9 +1298,9 @@ func checkWithRetries(ctx context.Context, username string, pool *proxyPool,
 		// lockstep swung the rate between zero and nine thousand per second in
 		// alternating bursts. Global back-pressure is the limiter's job, and it
 		// has already been told.
-		if out.retryable && attempt < attempts-1 {
+		if out.retryable && answers < attempts {
 			select {
-			case <-time.After(retryPause(attempt)):
+			case <-time.After(retryPause(try)):
 			case <-ctx.Done():
 				return outcomeResult(username, out, cfg)
 			}
@@ -1839,8 +1891,8 @@ func parseFlags() *config {
 		"skip testing the proxies before the run")
 	flag.BoolVar(&cfg.checkProxiesOnly, "check-proxies", false,
 		"test the proxies, print the report, and exit")
-	flag.BoolVar(&cfg.pruneProxies, "prune-proxies", false,
-		"remove proxies that failed the test from the proxies file")
+	flag.BoolVar(&cfg.keepDeadProxies, "keep-dead-proxies", false,
+		"leave proxies that failed the test in the proxies file")
 	flag.IntVar(&cfg.targetRPS, "target", 0,
 		"aim for this many requests per second; sets -t from the measured latency")
 	flag.IntVar(&cfg.perProxy, "per-proxy", defaultPerProxy,
@@ -1870,7 +1922,8 @@ options:
   -no-adapt             disable adaptive concurrency (drive threads flat out)
   -http2                use HTTP/2 (one connection per host, far less parallel)
   -check-proxies        test the proxies, print the report, and exit
-  -prune-proxies        remove failed proxies from the proxies file
+  -keep-dead-proxies    leave dead proxies in the list (they are moved to
+                        proxies-dead.txt by default)
   -no-proxy-check       skip the pre-flight proxy test
   -target N             aim for N requests/sec; sets -t from measured latency
   -per-proxy N          max requests in flight per proxy    (default 10)

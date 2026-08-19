@@ -145,7 +145,7 @@ That needs no username list, so it works before your list is even ready.
 | Flag | Effect |
 |------|--------|
 | `-check-proxies` | run the test, print the report, exit |
-| `-prune-proxies` | delete the proxies that were tested and failed (comments kept; anything not tested is left alone) |
+| `-keep-dead-proxies` | leave dead proxies in the list. By default they are **moved** to `proxies-dead.txt` with the reason they failed, then taken out of `proxies.txt` (comments kept; anything not tested is left alone) |
 | `-no-proxy-check` | skip the pre-flight |
 | `-target N` | aim for N requests/sec — sets `-t` from the measured latency |
 | `-per-proxy N` | max requests in flight through one proxy (default 10, `0` = no limit) |
@@ -311,6 +311,50 @@ limiter, so `-no-adapt` switches it off along with everything else. Under
 ```
   Capacity : 10 per proxy - NOT enforced, -no-adapt drives all 2089 threads regardless
 ```
+
+## Dead proxies are moved, not deleted
+
+A proxy the pre-flight proves dead leaves the live list and lands in
+`proxies-dead.txt`, carrying the reason:
+
+```
+http://45.12.9.180:8080     # proxy auth failed (wrong user/pass)
+http://198.51.100.7:3128    # timeout (slow proxy or -timeout too low)
+```
+
+Moved rather than deleted, for two reasons. It is still something you paid for
+and may want to take back to your provider — and the reason is the part a refund
+request actually needs. And providers rotate: a line that is dead this week may
+be alive next week, and a line silently removed from a file is a line nobody can
+argue about.
+
+The file is appended to across runs and written `0600`, since these lines name
+proxies you pay for. `-keep-dead-proxies` turns the move off. Anything the test
+did not reach — an interrupted pre-flight, say — is never called dead.
+
+## A dropped connection is not an answer
+
+`-retries` is how many times to **ask** about a name. It used to also pay for
+every time a proxy failed to carry the question, and those are different things.
+
+A real proxy under load does not queue politely; past its limit it drops the
+connection. That drop says nothing whatsoever about the username — but it
+consumed one of only two tries, and twice over the name was written to
+`errors.txt`. Measured against a proxy that drops past its concurrency limit:
+
+| | names resolved | reported as errors |
+|---|---|---|
+| before | 3 052 / 5 000 | **1 948 (39%)** |
+| after | **5 000 / 5 000** | **0** |
+
+At `-t 800` it was 46% before, and zero after. Transport failures now draw on
+their own allowance, and every retry deliberately steps to a different proxy —
+the one that just dropped the connection is the least likely in the pool to
+carry the next one.
+
+This is also most of the answer to "high `-t` gives me errors". A high thread
+count is what pushes a pool past the point where it starts dropping, so the two
+complaints were the same bug.
 
 ## Notifications
 

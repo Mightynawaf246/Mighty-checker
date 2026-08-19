@@ -445,6 +445,47 @@ func pctl(sorted []time.Duration, p int) time.Duration {
 // Only proxies PROVEN dead are removed. A proxy that was never tested - because
 // the pre-flight was interrupted - is kept: the alternative deleted whole lists
 // of working, paid proxies on a Ctrl-C.
+// deadProxiesFile is where proxies that failed the test are kept.
+//
+// They are moved rather than deleted. A dead proxy is still something the user
+// paid for and may want to take back to their provider, or retry next week when
+// the provider has rotated it - and a line silently removed from a file is a
+// line nobody can argue about. The reason it failed travels with it, since that
+// is the part a refund request actually needs.
+const deadProxiesFile = "proxies-dead.txt"
+
+// writeDeadProxies records everything the test proved dead, with its reason,
+// appending so the record survives across runs.
+func writeDeadProxies(cfg *config, reports []proxyReport) (n int, err error) {
+	var lines []string
+	for _, r := range reports {
+		if !r.tested || r.ok || r.spec == nil {
+			continue
+		}
+		reason := r.reason
+		if reason == "" {
+			reason = "no response"
+		}
+		lines = append(lines, fmt.Sprintf("%s  # %s", r.spec.String(), reason))
+	}
+	if len(lines) == 0 {
+		return 0, nil
+	}
+
+	path := outPath(cfg, deadProxiesFile)
+	// 0600: these lines name proxies the user pays for. Appended, never
+	// truncated - this is the only copy once the live list has been pruned.
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+	if _, err := fmt.Fprintln(f, strings.Join(lines, "\n")); err != nil {
+		return 0, err
+	}
+	return len(lines), nil
+}
+
 func pruneProxies(path string, reports []proxyReport) (kept int, err error) {
 	failed := make(map[string]bool, len(reports))
 	for _, r := range reports {
