@@ -54,6 +54,7 @@ type config struct {
 	onAvailable      string
 	targetRPS        int
 	perProxy         int
+	perProxyRPS      int
 }
 
 // liveStats holds counters written by workers and read by the status line, so
@@ -424,6 +425,7 @@ func main() {
 	} else {
 		pool = newProxyPool(nil)
 	}
+	pool.setRateLimit(float64(cfg.perProxyRPS))
 
 	if cfg.outDir != "" && cfg.outDir != "." {
 		if err := os.MkdirAll(cfg.outDir, 0o755); err != nil {
@@ -1180,6 +1182,13 @@ func attemptOnce(ctx context.Context, username string, pool *proxyPool,
 	client, err := cache.clientFor(p)
 	if err != nil {
 		out.err = err
+		return out
+	}
+
+	// Pace this individual IP first (opt-in via -per-proxy-rps), before taking a
+	// concurrency slot, so waiting on a slow-paced IP never ties one up.
+	if !pool.rateWait(ctx, p) {
+		out.err = ctx.Err()
 		return out
 	}
 
@@ -2024,6 +2033,8 @@ func parseFlags() *config {
 		"aim for this many requests per second; sets -t from the measured latency")
 	flag.IntVar(&cfg.perProxy, "per-proxy", defaultPerProxy,
 		"max requests in flight through one proxy (0 = no limit)")
+	flag.IntVar(&cfg.perProxyRPS, "per-proxy-rps", 0,
+		"max requests per second per proxy IP (0 = no limit; use on static ISP IPs)")
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, `Mighty - Instagram username availability checker
@@ -2059,6 +2070,7 @@ options:
   -no-proxy-check       skip the pre-flight proxy test
   -target N             aim for N requests/sec; sets -t from measured latency
   -per-proxy N          max requests in flight per proxy    (default 10)
+  -per-proxy-rps N      max requests/sec per proxy IP        (0 = off)
   -update               check for a new version and update in place
   -version              print the version and exit
   -no-update-check      skip the startup update check

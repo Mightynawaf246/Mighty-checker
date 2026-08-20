@@ -302,6 +302,8 @@ type proxyPool struct {
 	maxFails   int           // failures before quarantine
 	quarantine time.Duration // how long a bad proxy is skipped
 
+	rl *ipRateLimiter // optional per-IP requests/second cap; nil = disabled
+
 	// Derived state, all refreshed together at most once per refreshEvery.
 	//
 	// These are cached rather than computed on demand because both were being
@@ -342,6 +344,21 @@ func newProxyPool(items []*proxySpec) *proxyPool {
 		quarantine: 60 * time.Second,
 		healthyN:   len(items),
 	}
+}
+
+// setRateLimit installs a per-IP requests/second cap (0 disables it). Safe to
+// call once at start-up before any workers run.
+func (p *proxyPool) setRateLimit(perSecond float64) {
+	p.rl = newIPRateLimiter(perSecond)
+}
+
+// rateWait paces one request against the chosen proxy's IP. It returns false
+// only if ctx is cancelled. A nil limiter or a direct (nil) proxy admit at once.
+func (p *proxyPool) rateWait(ctx context.Context, s *proxySpec) bool {
+	if p.rl == nil || s == nil {
+		return true
+	}
+	return p.rl.wait(ctx, s.key())
 }
 
 func (p *proxyPool) len() int {
