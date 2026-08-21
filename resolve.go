@@ -375,6 +375,17 @@ func baseName(line string) string {
 	return strings.TrimSpace(s)
 }
 
+// lineHasID reports whether a line already carries a numeric id, i.e. it looks
+// like "username:<digits>". Used by -resolve-first to leave resolved names be.
+func lineHasID(line string) bool {
+	s := strings.TrimSpace(strings.TrimRight(line, "\r"))
+	i := strings.IndexByte(s, ':')
+	if i < 0 {
+		return false
+	}
+	return isAllDigits(strings.TrimSpace(s[i+1:]))
+}
+
 // runResolve is the whole "-resolve-ids" mode. It resolves every username in
 // the list to its numeric id and writes "username:id" back INTO the usernames
 // file itself, in place - so reopening usernames.txt shows the id next to each
@@ -425,6 +436,11 @@ func runResolve(ctx context.Context, cfg *config, usernames []string,
 	var work []job
 	for i, ln := range lines {
 		if strings.HasPrefix(strings.TrimSpace(ln), "#") {
+			continue
+		}
+		// In fill-missing mode, a line that already carries ":id" is left
+		// untouched - nothing is pulled or changed for it.
+		if cfg.fillMissingOnly && lineHasID(ln) {
 			continue
 		}
 		name := baseName(ln)

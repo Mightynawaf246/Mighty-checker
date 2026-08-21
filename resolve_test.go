@@ -150,6 +150,96 @@ func TestLoadAuthTokenParsesForms(t *testing.T) {
 	}
 }
 
+// TestRunResolveEndToEndTypeahead exercises the FULL resolver path the way the
+// binary does: a session.txt holding a mobile Bearer token, a usernames.txt
+// list, the typeahead mobile endpoint, and the in-place write-back of ids.
+func TestRunResolveEndToEndTypeahead(t *testing.T) {
+	srv := fakeTypeahead(t)
+	old := resolveTypeaheadURL
+	resolveTypeaheadURL = srv.URL
+	t.Cleanup(func() { resolveTypeaheadURL = old })
+
+	dir := t.TempDir()
+	// a realistic session file: the exact header line copied from the app
+	sess := filepath.Join(dir, "session.txt")
+	os.WriteFile(sess, []byte("authorization: Bearer IGT:2:fake.mobile.token\n"), 0o600)
+
+	uf := filepath.Join(dir, "usernames.txt")
+	os.WriteFile(uf, []byte("# my list\nalice\nbob\nnouser1\n"), 0o644)
+
+	cfg := &config{threads: 4, timeout: 5 * time.Second, retries: 1,
+		outDir: dir, usernamesFile: uf, sessionFile: sess}
+
+	runResolve(context.Background(), cfg, []string{"alice", "bob", "nouser1"}, newProxyPool(nil),
+		newClientCacheFor(cfg.timeout, cfg.threads, 0), newAdaptiveLimiter(cfg.threads, true))
+
+	got, _ := os.ReadFile(uf)
+	out := string(got)
+	// exact-match names get their pk written next to them, in place
+	for _, want := range []string{"alice:5000", "bob:3000", "# my list"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("usernames.txt missing %q:\n%s", want, out)
+		}
+	}
+	// a fuzzy-only name stays untouched (no wrong id guessed)
+	if strings.Contains(out, "nouser1:") {
+		t.Errorf("fuzzy-only name should not get an id:\n%s", out)
+	}
+	// ids.txt carries the same resolved pairs
+	ids, _ := os.ReadFile(filepath.Join(dir, "ids.txt"))
+	if !strings.Contains(string(ids), "alice:5000") {
+		t.Errorf("ids.txt missing resolved pair:\n%s", ids)
+	}
+}
+
+// TestRunResolveFillMissingOnly proves the -resolve-first behavior: a line that
+// already has an id is left exactly as it was; only the bare names get filled.
+func TestRunResolveFillMissingOnly(t *testing.T) {
+	srv := fakeProfileInfo(t)
+	old := resolveURL
+	resolveURL = srv.URL
+	t.Cleanup(func() { resolveURL = old })
+
+	dir := t.TempDir()
+	uf := filepath.Join(dir, "usernames.txt")
+	// alice already resolved (must be untouched), bob bare (must be filled)
+	orig := "# list\nalice:123456\nbob\n"
+	os.WriteFile(uf, []byte(orig), 0o644)
+
+	cfg := &config{threads: 4, timeout: 5 * time.Second, retries: 1,
+		outDir: dir, usernamesFile: uf, sessionFile: "", fillMissingOnly: true}
+
+	runResolve(context.Background(), cfg, []string{"alice", "bob"}, newProxyPool(nil),
+		newClientCacheFor(cfg.timeout, cfg.threads, 0), newAdaptiveLimiter(cfg.threads, true))
+
+	out, _ := os.ReadFile(uf)
+	s := string(out)
+	// alice's existing id is preserved, NOT overwritten with the mock's id
+	if !strings.Contains(s, "alice:123456") {
+		t.Errorf("existing id must be left untouched:\n%s", s)
+	}
+	// bob (bare) gets its id filled (len("bob")=3 -> "3000" from the mock)
+	if !strings.Contains(s, "bob:3000") {
+		t.Errorf("bare name should be filled:\n%s", s)
+	}
+}
+
+func TestLineHasID(t *testing.T) {
+	cases := map[string]bool{
+		"alice:123":   true,
+		"alice:123\r": true,
+		"alice":       false,
+		"alice:":      false,
+		"alice:notid": false,
+		"# comment":   false,
+	}
+	for line, want := range cases {
+		if got := lineHasID(line); got != want {
+			t.Errorf("lineHasID(%q)=%v want %v", line, got, want)
+		}
+	}
+}
+
 func TestLoadSessionParsesBothForms(t *testing.T) {
 	dir := t.TempDir()
 	// full cookie line

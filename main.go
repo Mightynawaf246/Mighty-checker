@@ -56,6 +56,8 @@ type config struct {
 	perProxy         int
 	perProxyRPS      int
 	resolveIDs       bool
+	resolveFirst     bool
+	fillMissingOnly  bool
 	sessionFile      string
 }
 
@@ -415,6 +417,12 @@ func main() {
 		if len(usernames) == 0 {
 			fatalf("no usernames found in %s", cfg.usernamesFile)
 		}
+		// The list may already hold "username:id" pairs (from a resolver run).
+		// The availability check is about the NAME, so always check the bare
+		// username - strip any ":id" so a resolved list checks correctly.
+		for i := range usernames {
+			usernames[i] = baseName(usernames[i])
+		}
 	}
 
 	var pool *proxyPool
@@ -546,6 +554,23 @@ func main() {
 	if cfg.resolveIDs {
 		runResolve(ctx, cfg, usernames, pool, cache, lim)
 		return
+	}
+
+	// -resolve-first: fill in any MISSING ids before the check starts. Names
+	// that already carry ":id" are left exactly as they are (nothing pulled,
+	// nothing changed). Then reload the list and check the bare names. This is
+	// the "put names in, run the checker, ids get filled, then it checks" flow.
+	if cfg.resolveFirst {
+		cfg.fillMissingOnly = true
+		runResolve(ctx, cfg, usernames, pool, cache, lim)
+		cfg.fillMissingOnly = false
+		if reloaded, err := loadLines(cfg.usernamesFile); err == nil && len(reloaded) > 0 {
+			for i := range reloaded {
+				reloaded[i] = baseName(reloaded[i])
+			}
+			usernames = reloaded
+		}
+		fmt.Println()
 	}
 
 	if cfg.selfTestOnly {
@@ -2046,8 +2071,10 @@ func parseFlags() *config {
 		"max requests per second per proxy IP (0 = no limit; use on static ISP IPs)")
 	flag.BoolVar(&cfg.resolveIDs, "resolve-ids", false,
 		"resolver mode: fill username:id back into the usernames file (and ids.txt)")
+	flag.BoolVar(&cfg.resolveFirst, "resolve-first", false,
+		"before the availability check, fill in any missing ids in the list (names that already have :id are left as they are), then start checking")
 	flag.StringVar(&cfg.sessionFile, "session-file", "session.txt",
-		"session for -resolve-ids: a sessionid or full cookie line; never printed")
+		"session for -resolve-ids / -resolve-first: a mobile Bearer token or a sessionid; never printed")
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, `Mighty - Instagram username availability checker
@@ -2085,7 +2112,8 @@ options:
   -per-proxy N          max requests in flight per proxy    (default 10)
   -per-proxy-rps N      max requests/sec per proxy IP        (0 = off)
   -resolve-ids          resolver mode: write id next to each name in the list
-  -session-file FILE    session for -resolve-ids (default session.txt)
+  -resolve-first        fill missing ids in the list first, then start the check
+  -session-file FILE    session for -resolve-ids/-resolve-first (default session.txt)
   -update               check for a new version and update in place
   -version              print the version and exit
   -no-update-check      skip the startup update check
