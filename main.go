@@ -55,6 +55,8 @@ type config struct {
 	targetRPS        int
 	perProxy         int
 	perProxyRPS      int
+	resolveIDs       bool
+	sessionFile      string
 }
 
 // liveStats holds counters written by workers and read by the status line, so
@@ -537,6 +539,13 @@ func main() {
 		// Start from what the pool can carry rather than discovering it by
 		// overloading every proxy first.
 		lim.setCeiling(pool.healthy() * cfg.perProxy)
+	}
+
+	// Resolver mode: a different job from availability - turn each username
+	// into its numeric id. It reuses the same engine and returns early.
+	if cfg.resolveIDs {
+		runResolve(ctx, cfg, usernames, pool, cache, lim)
+		return
 	}
 
 	if cfg.selfTestOnly {
@@ -2035,6 +2044,10 @@ func parseFlags() *config {
 		"max requests in flight through one proxy (0 = no limit)")
 	flag.IntVar(&cfg.perProxyRPS, "per-proxy-rps", 0,
 		"max requests per second per proxy IP (0 = no limit; use on static ISP IPs)")
+	flag.BoolVar(&cfg.resolveIDs, "resolve-ids", false,
+		"resolver mode: read usernames and write username:id to ids.txt")
+	flag.StringVar(&cfg.sessionFile, "session-file", "session.txt",
+		"session for -resolve-ids: a sessionid or full cookie line; never printed")
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, `Mighty - Instagram username availability checker
@@ -2071,6 +2084,8 @@ options:
   -target N             aim for N requests/sec; sets -t from measured latency
   -per-proxy N          max requests in flight per proxy    (default 10)
   -per-proxy-rps N      max requests/sec per proxy IP        (0 = off)
+  -resolve-ids          resolver mode: usernames -> ids.txt (username:id)
+  -session-file FILE    session for -resolve-ids (default session.txt)
   -update               check for a new version and update in place
   -version              print the version and exit
   -no-update-check      skip the startup update check
