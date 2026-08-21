@@ -71,6 +71,85 @@ func TestRunResolveWritesIDs(t *testing.T) {
 	}
 }
 
+// mock typeahead_stream: returns a fuzzy list of users, each with a pk. The
+// exact-match user carries a deterministic id so the test can assert it.
+func fakeTypeahead(t *testing.T) *httptest.Server {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// require the mobile token + app-id, like the real endpoint
+		if !strings.HasPrefix(r.Header.Get("Authorization"), "Bearer ") {
+			w.WriteHeader(403)
+			fmt.Fprint(w, `{"message":"login_required"}`)
+			return
+		}
+		name := r.URL.Query().Get("query")
+		if name == "" || strings.HasPrefix(name, "nouser") {
+			// a plausible fuzzy-but-no-exact-match result
+			fmt.Fprint(w, `{"users":[{"position":0,"user":{"pk":"999","username":"someoneelse"}}],"status":"ok"}`)
+			return
+		}
+		// exact match nested under "user", plus a decoy fuzzy match first
+		fmt.Fprintf(w, `{"users":[`+
+			`{"position":0,"user":{"pk":"111","username":"%s_decoy"}},`+
+			`{"position":1,"user":{"pk":"%d000","username":"%s"}}`+
+			`],"status":"ok"}`, name, len(name), name)
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func TestResolveViaTypeaheadExactMatch(t *testing.T) {
+	srv := fakeTypeahead(t)
+	old := resolveTypeaheadURL
+	resolveTypeaheadURL = srv.URL
+	t.Cleanup(func() { resolveTypeaheadURL = old })
+
+	creds := resolveCreds{auth: "Bearer IGT:2:testtoken"}
+	id, found, err := resolveViaTypeahead(context.Background(), srv.Client(), "target", creds)
+	if err != nil || !found || id != "6000" {
+		t.Fatalf("want id=6000 found: got id=%q found=%v err=%v", id, found, err)
+	}
+	// a fuzzy-only result (no exact match) is not-found, not a wrong guess
+	id, found, err = resolveViaTypeahead(context.Background(), srv.Client(), "nouser1", creds)
+	if err != nil || found || id != "" {
+		t.Fatalf("expected not-found for fuzzy-only, got id=%q found=%v err=%v", id, found, err)
+	}
+}
+
+func TestResolveViaTypeaheadNeedsToken(t *testing.T) {
+	srv := fakeTypeahead(t)
+	old := resolveTypeaheadURL
+	resolveTypeaheadURL = srv.URL
+	t.Cleanup(func() { resolveTypeaheadURL = old })
+
+	// no token -> server answers 403 -> surfaced as an error, not a false id
+	_, found, err := resolveViaTypeahead(context.Background(), srv.Client(), "target", resolveCreds{})
+	if err == nil || found {
+		t.Fatalf("want an error without a token, got found=%v err=%v", found, err)
+	}
+}
+
+func TestLoadAuthTokenParsesForms(t *testing.T) {
+	dir := t.TempDir()
+	cases := map[string]string{
+		"header.txt": "authorization: Bearer IGT:2:abc.def\n",
+		"value.txt":  "Bearer IGT:2:abc.def\n",
+		"bare.txt":   "IGT:2:abc.def\n",
+	}
+	for file, content := range cases {
+		p := filepath.Join(dir, file)
+		os.WriteFile(p, []byte(content), 0o600)
+		if got := loadAuthToken(p); got != "Bearer IGT:2:abc.def" {
+			t.Errorf("%s: got %q", file, got)
+		}
+	}
+	// a plain sessionid file yields no bearer token
+	p := filepath.Join(dir, "cookie.txt")
+	os.WriteFile(p, []byte("sessionid=71%3Aabc%3A9\n"), 0o600)
+	if got := loadAuthToken(p); got != "" {
+		t.Errorf("cookie-only file should have no token, got %q", got)
+	}
+}
+
 func TestLoadSessionParsesBothForms(t *testing.T) {
 	dir := t.TempDir()
 	// full cookie line

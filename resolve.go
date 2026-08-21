@@ -15,6 +15,7 @@ package main
 // volume breaks Instagram's terms and risks the account - the risk is yours.
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -23,6 +24,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -33,6 +35,27 @@ import (
 var resolveURL = "https://i.instagram.com/api/v1/users/web_profile_info/"
 
 const webProfileAppID = "936619743392459"
+
+// resolveTypeaheadURL is the MOBILE search endpoint: it takes query=<username>
+// and returns a list of matching users, each carrying its numeric "pk" (= id).
+// This is the connection captured from the Instagram Android app - it needs a
+// mobile Bearer token (Authorization: Bearer IGT:2:...), which is why it works
+// where the anonymous web GET does not. A var so tests can point it local.
+var resolveTypeaheadURL = "https://i.instagram.com/api/v1/fbsearch/typeahead_stream/"
+
+// mobileAppID and mobileUA identify the Instagram Android client. The typeahead
+// endpoint expects the mobile app-id, not the web one.
+const mobileAppID = "567067343352427"
+const mobileUA = "Instagram 400.0.0.49.68 Android (37/17; 420dpi; 1080x2400; " +
+	"Google/google; sdk_gphone16k_x86_64; emu64xa16k; ranchu; en_US; 799297105)"
+
+// resolveCreds carries whichever authentication the session file yielded.
+// auth (a mobile Bearer token) selects the typeahead path; otherwise cookie
+// (a sessionid) drives web_profile_info.
+type resolveCreds struct {
+	cookie string // sessionid cookie -> web_profile_info
+	auth   string // "Bearer IGT:2:..." -> fbsearch/typeahead_stream
+}
 
 // loadSession reads a sessionid from a file: either a bare sessionid or a full
 // cookie line containing "sessionid=...". Returns "" when absent. Never logged.
@@ -59,6 +82,160 @@ func loadSession(path string) string {
 		return line // bare sessionid
 	}
 	return ""
+}
+
+// loadAuthToken reads a mobile Bearer token from the session file. It accepts a
+// line copied straight from the captured request in any of these shapes:
+//
+//	authorization: Bearer IGT:2:...   (full header line)
+//	Bearer IGT:2:...                  (header value)
+//	IGT:2:...                         (bare token)
+//
+// Returns "" when none is present. The token is a credential and is NEVER
+// printed or logged.
+func loadAuthToken(path string) string {
+	if path == "" {
+		return ""
+	}
+	lines, err := loadLines(path)
+	if err != nil {
+		return ""
+	}
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		// drop an optional "authorization:" header prefix
+		if strings.HasPrefix(strings.ToLower(line), "authorization:") {
+			line = strings.TrimSpace(line[len("authorization:"):])
+		}
+		if strings.HasPrefix(line, "Bearer ") {
+			return line
+		}
+		if strings.HasPrefix(line, "IGT:") {
+			return "Bearer " + line
+		}
+	}
+	return ""
+}
+
+// pkFromUserObject reads the numeric id out of one Instagram user object,
+// trying the several field names IG uses ("pk", "pk_id", "id").
+func pkFromUserObject(m map[string]interface{}) (string, bool) {
+	for _, k := range []string{"pk", "pk_id", "id"} {
+		switch v := m[k].(type) {
+		case string:
+			if v != "" && isAllDigits(v) {
+				return v, true
+			}
+		case json.Number:
+			return v.String(), true
+		case float64:
+			return strconv.FormatInt(int64(v), 10), true
+		}
+	}
+	return "", false
+}
+
+// findPKByUsername walks a decoded JSON tree and returns the pk of the object
+// whose "username" equals target (case-insensitive). This tolerates the exact
+// shape of the typeahead response changing: the user object may sit at the top
+// level, inside a "users" array, or nested under a "user" key.
+func findPKByUsername(v interface{}, target string) (string, bool) {
+	switch t := v.(type) {
+	case map[string]interface{}:
+		if un, ok := t["username"].(string); ok && strings.EqualFold(un, target) {
+			if pk, ok := pkFromUserObject(t); ok {
+				return pk, true
+			}
+		}
+		for _, child := range t {
+			if pk, ok := findPKByUsername(child, target); ok {
+				return pk, true
+			}
+		}
+	case []interface{}:
+		for _, child := range t {
+			if pk, ok := findPKByUsername(child, target); ok {
+				return pk, true
+			}
+		}
+	}
+	return "", false
+}
+
+func isAllDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// resolveViaTypeahead resolves one username through the mobile search endpoint.
+// It sends the Bearer token (and, if present, the sessionid cookie), reads the
+// list of matching users, and returns the pk of the EXACT username match. A
+// fuzzy-only result (no exact match) is reported as not-found rather than
+// guessing a wrong id. We deliberately do NOT request zstd, so Go transparently
+// gzip-decodes the body with no extra dependency.
+func resolveViaTypeahead(ctx context.Context, client *http.Client, username string, creds resolveCreds) (id string, found bool, err error) {
+	q := url.Values{}
+	q.Set("search_surface", "typeahead_search_page")
+	q.Set("count", "30")
+	q.Set("query", username)
+	q.Set("context", "blended")
+	u := resolveTypeaheadURL + "?" + q.Encode()
+
+	req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
+	if err != nil {
+		return "", false, err
+	}
+	req.Header.Set("User-Agent", mobileUA)
+	req.Header.Set("X-IG-App-ID", mobileAppID)
+	req.Header.Set("Accept", "*/*")
+	if creds.auth != "" {
+		req.Header.Set("Authorization", creds.auth)
+	}
+	if creds.cookie != "" {
+		req.Header.Set("Cookie", "sessionid="+creds.cookie)
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", false, err
+	}
+	defer func() {
+		io.CopyN(io.Discard, resp.Body, maxDrainBytes)
+		resp.Body.Close()
+	}()
+
+	if resp.StatusCode == 404 {
+		return "", false, nil
+	}
+	if resp.StatusCode != 200 {
+		return "", false, fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, maxBodyBytes))
+
+	// The response is a "stream": usually one JSON object, but occasionally
+	// several concatenated. Decode each in turn and search it for the name.
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	for {
+		var v interface{}
+		if derr := dec.Decode(&v); derr != nil {
+			break
+		}
+		if pk, ok := findPKByUsername(v, username); ok {
+			return pk, true, nil
+		}
+	}
+	return "", false, nil
 }
 
 // resolveOne fetches the numeric id for one username. found=false means the
@@ -111,7 +288,7 @@ func resolveOne(ctx context.Context, client *http.Client, username, session stri
 // resolveAttempt runs one try through one proxy, mirroring attemptOnce's proxy
 // health, concurrency, and per-IP rate handling.
 func resolveAttempt(ctx context.Context, username string, pool *proxyPool, cache *clientCache,
-	cfg *config, lim *adaptiveLimiter, session, avoid string) (id string, found bool, err error, usedKey string) {
+	cfg *config, lim *adaptiveLimiter, creds resolveCreds, avoid string) (id string, found bool, err error, usedKey string) {
 
 	p := pool.nextExcluding(avoid)
 	if p != nil {
@@ -135,7 +312,13 @@ func resolveAttempt(ctx context.Context, username string, pool *proxyPool, cache
 		rctx, cancel = context.WithTimeout(ctx, cfg.timeout)
 	}
 	started := time.Now()
-	id, found, err = resolveOne(rctx, client, username, session)
+	// A mobile Bearer token means the captured typeahead (mobile) connection;
+	// otherwise fall back to the web_profile_info GET.
+	if creds.auth != "" {
+		id, found, err = resolveViaTypeahead(rctx, client, username, creds)
+	} else {
+		id, found, err = resolveOne(rctx, client, username, creds.cookie)
+	}
 	took := time.Since(started)
 	if cancel != nil {
 		cancel()
@@ -155,7 +338,7 @@ func resolveAttempt(ctx context.Context, username string, pool *proxyPool, cache
 
 // resolveWithRetry rotates proxies across attempts until it gets a clean answer.
 func resolveWithRetry(ctx context.Context, username string, pool *proxyPool, cache *clientCache,
-	cfg *config, lim *adaptiveLimiter, session string) (string, bool, error) {
+	cfg *config, lim *adaptiveLimiter, creds resolveCreds) (string, bool, error) {
 
 	tries := cfg.retries
 	if tries < 1 {
@@ -167,7 +350,7 @@ func resolveWithRetry(ctx context.Context, username string, pool *proxyPool, cac
 		if ctx.Err() != nil {
 			return "", false, ctx.Err()
 		}
-		id, found, err, key := resolveAttempt(ctx, username, pool, cache, cfg, lim, session, avoid)
+		id, found, err, key := resolveAttempt(ctx, username, pool, cache, cfg, lim, creds, avoid)
 		if err == nil {
 			return id, found, nil
 		}
@@ -202,13 +385,21 @@ func baseName(line string) string {
 func runResolve(ctx context.Context, cfg *config, usernames []string,
 	pool *proxyPool, cache *clientCache, lim *adaptiveLimiter) {
 
-	session := loadSession(cfg.sessionFile)
-	if session == "" {
-		warnf("no session in %s - web_profile_info usually needs one; "+
-			"expect mostly errors/not-found without it", cfg.sessionFile)
-	} else {
+	creds := resolveCreds{
+		cookie: loadSession(cfg.sessionFile),
+		auth:   loadAuthToken(cfg.sessionFile),
+	}
+	switch {
+	case creds.auth != "":
 		fmt.Println(" " + label("Resolve IDs") + " " +
-			cGray(fmt.Sprintf("%d names, session loaded (never printed)", len(usernames))))
+			cGray(fmt.Sprintf("%d names, mobile token loaded (never printed) - typeahead connection", len(usernames))))
+	case creds.cookie != "":
+		fmt.Println(" " + label("Resolve IDs") + " " +
+			cGray(fmt.Sprintf("%d names, session loaded (never printed) - web_profile_info", len(usernames))))
+	default:
+		warnf("no token/session in %s - the resolver needs a mobile Bearer token "+
+			"(Authorization: Bearer IGT:2:...) or a sessionid; expect mostly errors/not-found without one",
+			cfg.sessionFile)
 	}
 
 	// Read the file raw so comments, blank lines, and order survive the
@@ -266,7 +457,7 @@ func runResolve(ctx context.Context, cfg *config, usernames []string,
 				if ctx.Err() != nil {
 					return
 				}
-				id, found, rerr := resolveWithRetry(ctx, j.name, pool, cache, cfg, lim, session)
+				id, found, rerr := resolveWithRetry(ctx, j.name, pool, cache, cfg, lim, creds)
 				switch {
 				case rerr != nil:
 					errN.Add(1)
