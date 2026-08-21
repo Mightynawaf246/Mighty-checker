@@ -2045,7 +2045,7 @@ func parseFlags() *config {
 	flag.IntVar(&cfg.perProxyRPS, "per-proxy-rps", 0,
 		"max requests per second per proxy IP (0 = no limit; use on static ISP IPs)")
 	flag.BoolVar(&cfg.resolveIDs, "resolve-ids", false,
-		"resolver mode: read usernames and write username:id to ids.txt")
+		"resolver mode: fill username:id back into the usernames file (and ids.txt)")
 	flag.StringVar(&cfg.sessionFile, "session-file", "session.txt",
 		"session for -resolve-ids: a sessionid or full cookie line; never printed")
 
@@ -2084,7 +2084,7 @@ options:
   -target N             aim for N requests/sec; sets -t from measured latency
   -per-proxy N          max requests in flight per proxy    (default 10)
   -per-proxy-rps N      max requests/sec per proxy IP        (0 = off)
-  -resolve-ids          resolver mode: usernames -> ids.txt (username:id)
+  -resolve-ids          resolver mode: write id next to each name in the list
   -session-file FILE    session for -resolve-ids (default session.txt)
   -update               check for a new version and update in place
   -version              print the version and exit

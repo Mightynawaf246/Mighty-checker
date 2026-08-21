@@ -182,8 +182,23 @@ func resolveWithRetry(ctx context.Context, username string, pool *proxyPool, cac
 	return "", false, lastErr
 }
 
-// runResolve is the whole "-resolve-ids" mode: fan usernames across the pool,
-// resolve each to an id, and write "username:id" to ids.txt.
+// baseName returns the username part of a "username" or "username:id" line.
+// It is what a re-run resolves, so filling ids stays idempotent.
+func baseName(line string) string {
+	s := strings.TrimSpace(strings.TrimRight(line, "\r"))
+	if i := strings.IndexByte(s, ':'); i >= 0 {
+		s = s[:i]
+	}
+	return strings.TrimSpace(s)
+}
+
+// runResolve is the whole "-resolve-ids" mode. It resolves every username in
+// the list to its numeric id and writes "username:id" back INTO the usernames
+// file itself, in place - so reopening usernames.txt shows the id next to each
+// name. A name that could not be resolved (does not exist, or an error) keeps
+// its original line untouched, so a re-run only fills the gaps. A copy of the
+// resolved pairs is also written to ids.txt. It reuses the whole engine: the
+// proxy pool, the adaptive limiter, and the per-IP rate limiter.
 func runResolve(ctx context.Context, cfg *config, usernames []string,
 	pool *proxyPool, cache *clientCache, lim *adaptiveLimiter) {
 
@@ -196,35 +211,62 @@ func runResolve(ctx context.Context, cfg *config, usernames []string,
 			cGray(fmt.Sprintf("%d names, session loaded (never printed)", len(usernames))))
 	}
 
-	outPath := filepath.Join(cfg.outDir, "ids.txt")
-	f, err := os.OpenFile(outPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
-	if err != nil {
-		fatalf("cannot open %s: %v", outPath, err)
-	}
-	defer f.Close()
-	var wmu sync.Mutex
-	write := func(line string) {
-		wmu.Lock()
-		fmt.Fprintln(f, line)
-		wmu.Unlock()
+	// Read the file raw so comments, blank lines, and order survive the
+	// rewrite. If it cannot be read (e.g. a test passing names directly), fall
+	// back to the given slice and skip the in-place rewrite.
+	raw, readErr := os.ReadFile(cfg.usernamesFile)
+	var lines []string
+	inPlace := readErr == nil
+	if inPlace {
+		lines = strings.Split(string(raw), "\n")
+	} else {
+		lines = usernames
 	}
 
+	// idFor[i] holds the resolved id for line i ("" = leave the line as it is).
+	// Each index has exactly one writer goroutine, so writing it is race-free.
+	idFor := make([]string, len(lines))
+
+	type job struct {
+		idx  int
+		name string
+	}
+	var work []job
+	for i, ln := range lines {
+		if strings.HasPrefix(strings.TrimSpace(ln), "#") {
+			continue
+		}
+		name := baseName(ln)
+		if name == "" {
+			continue
+		}
+		work = append(work, job{idx: i, name: name})
+	}
+
+	outPath := filepath.Join(cfg.outDir, "ids.txt")
+	idsFile, ferr := os.Create(outPath)
+	if ferr != nil {
+		fatalf("cannot write %s: %v", outPath, ferr)
+	}
+	defer idsFile.Close()
+	var wmu sync.Mutex
+
 	var okN, missN, errN atomic.Int64
-	jobs := make(chan string, cfg.threads*2)
+	jobs := make(chan job, cfg.threads*2)
 	var wg sync.WaitGroup
 	workers := cfg.threads
 	if workers < 1 {
 		workers = 1
 	}
-	for i := 0; i < workers; i++ {
+	for w := 0; w < workers; w++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for name := range jobs {
+			for j := range jobs {
 				if ctx.Err() != nil {
 					return
 				}
-				id, found, rerr := resolveWithRetry(ctx, name, pool, cache, cfg, lim, session)
+				id, found, rerr := resolveWithRetry(ctx, j.name, pool, cache, cfg, lim, session)
 				switch {
 				case rerr != nil:
 					errN.Add(1)
@@ -232,22 +274,53 @@ func runResolve(ctx context.Context, cfg *config, usernames []string,
 					missN.Add(1)
 				default:
 					okN.Add(1)
-					line := name + ":" + id
-					write(line)
+					idFor[j.idx] = id
+					line := j.name + ":" + id
+					wmu.Lock()
+					fmt.Fprintln(idsFile, line)
+					wmu.Unlock()
 					fmt.Printf("[+] %s\n", line)
 				}
 			}
 		}()
 	}
-	for _, n := range usernames {
+	for _, j := range work {
 		select {
-		case jobs <- n:
+		case jobs <- j:
 		case <-ctx.Done():
 		}
 	}
 	close(jobs)
 	wg.Wait()
 
+	// Rewrite the usernames file in place: every resolved line becomes
+	// "username:id"; everything else is left exactly as it was.
+	if inPlace {
+		out := make([]string, len(lines))
+		for i, ln := range lines {
+			if idFor[i] != "" {
+				repl := baseName(ln) + ":" + idFor[i]
+				if strings.HasSuffix(ln, "\r") {
+					repl += "\r"
+				}
+				out[i] = repl
+			} else {
+				out[i] = ln
+			}
+		}
+		joined := strings.Join(out, "\n")
+		tmp := cfg.usernamesFile + ".tmp"
+		if err := os.WriteFile(tmp, []byte(joined), 0o644); err != nil {
+			warnf("could not write %s: %v (ids are still in %s)", cfg.usernamesFile, err, outPath)
+		} else if err := os.Rename(tmp, cfg.usernamesFile); err != nil {
+			warnf("could not replace %s: %v (ids are still in %s)", cfg.usernamesFile, err, outPath)
+		}
+	}
+
+	dst := outPath
+	if inPlace {
+		dst = cfg.usernamesFile + "  (+ " + outPath + ")"
+	}
 	fmt.Printf("\n[+] resolved: %d | not-found: %d | errors: %d  ->  %s\n",
-		okN.Load(), missN.Load(), errN.Load(), outPath)
+		okN.Load(), missN.Load(), errN.Load(), dst)
 }

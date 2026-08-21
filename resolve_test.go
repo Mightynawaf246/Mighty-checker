@@ -90,3 +90,43 @@ func TestLoadSessionParsesBothForms(t *testing.T) {
 		t.Errorf("missing should be empty, got %q", got)
 	}
 }
+
+func TestRunResolveWritesInPlace(t *testing.T) {
+	srv := fakeProfileInfo(t)
+	old := resolveURL
+	resolveURL = srv.URL
+	t.Cleanup(func() { resolveURL = old })
+
+	dir := t.TempDir()
+	uf := filepath.Join(dir, "usernames.txt")
+	orig := "# my list\nalice\n\nbob\nnouser7\nalice:OLD\n"
+	if err := os.WriteFile(uf, []byte(orig), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config{threads: 4, timeout: 5 * time.Second, retries: 1,
+		outDir: dir, usernamesFile: uf, sessionFile: ""}
+
+	runResolve(context.Background(), cfg, []string{"alice", "bob", "nouser7"}, newProxyPool(nil),
+		newClientCacheFor(cfg.timeout, cfg.threads, 0), newAdaptiveLimiter(cfg.threads, true))
+
+	got, _ := os.ReadFile(uf)
+	out := string(got)
+	// resolved names get their id in place (idempotent for alice:OLD -> alice:5000)
+	for _, want := range []string{"alice:5000", "bob:3000", "# my list"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("usernames.txt missing %q:\n%s", want, out)
+		}
+	}
+	// a not-found name keeps its original line
+	if !strings.Contains(out, "nouser7\n") && !strings.HasSuffix(strings.TrimRight(out, "\n"), "nouser7") {
+		t.Errorf("not-found name should be kept as-is:\n%s", out)
+	}
+	// the stale alice:OLD must have been refreshed, not left
+	if strings.Contains(out, "alice:OLD") {
+		t.Errorf("stale id not refreshed:\n%s", out)
+	}
+	// structure preserved: still has the blank line
+	if !strings.Contains(out, "\n\n") {
+		t.Errorf("blank line not preserved:\n%s", out)
+	}
+}
