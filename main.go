@@ -59,6 +59,9 @@ type config struct {
 	resolveFirst     bool
 	fillMissingOnly  bool
 	sessionFile      string
+	watchIDs         bool
+	watchInterval    time.Duration
+	watchConfirm     bool
 }
 
 // liveStats holds counters written by workers and read by the status line, so
@@ -553,6 +556,14 @@ func main() {
 	// into its numeric id. It reuses the same engine and returns early.
 	if cfg.resolveIDs {
 		runResolve(ctx, cfg, usernames, pool, cache, lim)
+		return
+	}
+
+	// Watch-by-id mode: follow specific accounts by their numeric id and fire
+	// the claimer the instant one renames and frees its handle. A different job
+	// from the availability check; it returns early.
+	if cfg.watchIDs {
+		runWatchIDs(ctx, cfg, pool, cache, lim)
 		return
 	}
 
@@ -2074,7 +2085,13 @@ func parseFlags() *config {
 	flag.BoolVar(&cfg.resolveFirst, "resolve-first", false,
 		"before the availability check, fill in any missing ids in the list (names that already have :id are left as they are), then start checking")
 	flag.StringVar(&cfg.sessionFile, "session-file", "session.txt",
-		"session for -resolve-ids / -resolve-first: a mobile Bearer token or a sessionid; never printed")
+		"session for -resolve-ids / -resolve-first / -watch-ids: a mobile Bearer token or a sessionid; never printed")
+	flag.BoolVar(&cfg.watchIDs, "watch-ids", false,
+		"watch \"username:id\" targets by account id; fire -on-available the instant a target renames and frees its handle")
+	flag.DurationVar(&cfg.watchInterval, "watch-interval", 15*time.Second,
+		"how often to re-check each watched account in -watch-ids")
+	flag.BoolVar(&cfg.watchConfirm, "watch-confirm", true,
+		"in -watch-ids, confirm a freed handle is actually available before firing the claimer")
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, `Mighty - Instagram username availability checker
@@ -2113,7 +2130,10 @@ options:
   -per-proxy-rps N      max requests/sec per proxy IP        (0 = off)
   -resolve-ids          resolver mode: write id next to each name in the list
   -resolve-first        fill missing ids in the list first, then start the check
-  -session-file FILE    session for -resolve-ids/-resolve-first (default session.txt)
+  -watch-ids            watch username:id targets; fire the claimer the moment a
+                        target renames and frees its handle
+  -watch-interval D     how often to re-check each watched account (default 15s)
+  -session-file FILE    session for -resolve-ids/-resolve-first/-watch-ids (default session.txt)
   -update               check for a new version and update in place
   -version              print the version and exit
   -no-update-check      skip the startup update check
