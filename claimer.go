@@ -443,13 +443,23 @@ func (c *claimer) saveUsed() {
 
 // warmReady reports how many accounts are warm and unburned right now.
 func (c *claimer) warmReady() int {
+	warm, _, _ := c.stats()
+	return warm
+}
+
+// stats reports live account counts for the status line: warm-and-ready,
+// burned (already took a handle), and the total loaded.
+func (c *claimer) stats() (warm, burned, total int) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	n := 0
+	total = len(c.accounts)
 	for _, a := range c.accounts {
-		if a.warmed && !a.used {
-			n++
+		switch {
+		case a.used:
+			burned++
+		case a.warmed:
+			warm++
 		}
 	}
-	return n
+	return warm, burned, total
 }

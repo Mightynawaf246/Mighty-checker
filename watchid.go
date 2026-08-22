@@ -254,8 +254,10 @@ func runWatchIDs(ctx context.Context, cfg *config, pool *proxyPool, cache *clien
 	// claimer (fastest - a single POST, accounts logged in up front) or an
 	// external -on-available command.
 	var hook *hookRunner
+	var cl *claimer
 	if cfg.builtinClaimer {
-		cl, err := newClaimer(cfg.sessionsFile, cfg.outDir, cfg.claimLive, con)
+		var err error
+		cl, err = newClaimer(cfg.sessionsFile, cfg.outDir, cfg.claimLive, con)
 		if err != nil {
 			fatalf("claimer: %v", err)
 		}
@@ -285,6 +287,7 @@ func runWatchIDs(ctx context.Context, cfg *config, pool *proxyPool, cache *clien
 	active := targets
 	fired := 0
 	announcedIdle := false
+	lastStatus := ""
 	for {
 		if ctx.Err() != nil {
 			break
@@ -337,6 +340,24 @@ func runWatchIDs(ctx context.Context, cfg *config, pool *proxyPool, cache *clien
 
 		active = still
 		fired += freed
+
+		// Live status: watching / claimed, plus the claimer's warm-burned
+		// account counts and any claims in flight. Printed only when it
+		// changes, so an idle watch does not spam the same line.
+		status := fmt.Sprintf("watching %d | claimed %d", len(active), fired)
+		if cl != nil {
+			warm, burned, total := cl.stats()
+			a2, done, failed, last := hook.claimStats()
+			status += fmt.Sprintf(" | accounts warm %d burned %d/%d | claims live %d ok %d fail %d",
+				warm, burned, total, a2, done, failed)
+			if last != "" {
+				status += " | last @" + last
+			}
+		}
+		if status != lastStatus {
+			con.log(cGray("  [status] " + status))
+			lastStatus = status
+		}
 
 		if len(active) == 0 {
 			if cfg.watchOnce {
