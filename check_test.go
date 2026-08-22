@@ -41,6 +41,23 @@ func TestInterpret(t *testing.T) {
 		// no longer reported as available.
 		{"data without validity", 200, `{"data":{"something":"else"}}`, statusUnknown, false},
 
+		// A proxy provider out of credit returns a body carrying the bare token
+		// "success" while asserting the opposite. It must NOT read as available:
+		// the contract is the "status" FIELD equal to "success", not any
+		// occurrence of the word. (This is the exact case hasJSONString defends.)
+		{"proxy insufficient balance", 200,
+			`{"success":false,"error":"Insufficient balance"}`, statusUnknown, false},
+		{"bare success field is not the status field", 200,
+			`{"success":true}`, statusUnknown, false},
+		// Whitespace around the colon must not break the field match.
+		{"spaced status colon", 200, `{"status" : "success"}`, statusAvailable, false},
+		// An empty or null errors envelope is normal in a good reply and must not
+		// disqualify an otherwise-valid success.
+		{"empty errors array with success", 200,
+			`{"errors":[],"data":{"x":{"status":"success"}}}`, statusAvailable, false},
+		{"null errors with success", 200,
+			`{"errors":null,"status":"success"}`, statusAvailable, false},
+
 		{"empty body", 200, ``, statusUnknown, false},
 		{"errors array", 200, `{"errors":[{"message":"something else"}]}`, statusUnknown, false},
 		{"html on 200", 200, `<html><body>Please wait</body></html>`, statusUnknown, false},
