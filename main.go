@@ -62,6 +62,7 @@ type config struct {
 	watchIDs         bool
 	watchInterval    time.Duration
 	watchConfirm     bool
+	checkOnly        bool
 }
 
 // liveStats holds counters written by workers and read by the status line, so
@@ -563,6 +564,21 @@ func main() {
 	// the claimer the instant one renames and frees its handle. A different job
 	// from the availability check; it returns early.
 	if cfg.watchIDs {
+		runWatchIDs(ctx, cfg, pool, cache, lim)
+		return
+	}
+
+	// Default behavior of a plain run: if a session is present, do the whole
+	// catch pipeline automatically - fill any missing ids, then watch the
+	// accounts by id and fire the claimer the instant a handle frees. No flag,
+	// no extra file. Without a session there is nothing to watch with, so a
+	// plain run stays the availability check. -check-only forces the check even
+	// when a session exists.
+	if !cfg.checkOnly && !cfg.resolveFirst && hasSession(cfg) {
+		cfg.fillMissingOnly = true
+		runResolve(ctx, cfg, usernames, pool, cache, lim)
+		cfg.fillMissingOnly = false
+		fmt.Println()
 		runWatchIDs(ctx, cfg, pool, cache, lim)
 		return
 	}
@@ -2092,6 +2108,8 @@ func parseFlags() *config {
 		"how often to re-check each watched account in -watch-ids")
 	flag.BoolVar(&cfg.watchConfirm, "watch-confirm", true,
 		"in -watch-ids, confirm a freed handle is actually available before firing the claimer")
+	flag.BoolVar(&cfg.checkOnly, "check-only", false,
+		"force a plain availability check even when a session is present (skips the automatic watch-by-id)")
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, `Mighty - Instagram username availability checker
@@ -2133,7 +2151,12 @@ options:
   -watch-ids            watch username:id targets; fire the claimer the moment a
                         target renames and frees its handle
   -watch-interval D     how often to re-check each watched account (default 15s)
-  -session-file FILE    session for -resolve-ids/-resolve-first/-watch-ids (default session.txt)
+  -check-only           force a plain availability check even with a session set
+  -session-file FILE    session for the auto watch / -resolve-ids (default session.txt)
+
+  Note: with a session.txt present, a plain run automatically fills ids and
+  watches the accounts by id (claiming on release). Use -check-only for the
+  plain available/taken check.
   -update               check for a new version and update in place
   -version              print the version and exit
   -no-update-check      skip the startup update check

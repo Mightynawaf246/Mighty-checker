@@ -260,6 +260,33 @@ func TestLoadSessionParsesBothForms(t *testing.T) {
 	}
 }
 
+func TestLoadSessionSkipsBearerAndHasSession(t *testing.T) {
+	dir := t.TempDir()
+	// a token-only file: loadSession must NOT mistake the bearer line for a
+	// sessionid cookie, but hasSession must still be true (auth token present).
+	tok := filepath.Join(dir, "tok.txt")
+	os.WriteFile(tok, []byte("authorization: Bearer IGT:2:abc\n"), 0o600)
+	if got := loadSession(tok); got != "" {
+		t.Errorf("bearer line must not be read as a sessionid, got %q", got)
+	}
+	if !hasSession(&config{sessionFile: tok}) {
+		t.Errorf("hasSession should be true when a bearer token is present")
+	}
+	// a cookie file still yields the sessionid and hasSession is true
+	ck := filepath.Join(dir, "ck.txt")
+	os.WriteFile(ck, []byte("sessionid=71%3Aabc%3A9\n"), 0o600)
+	if got := loadSession(ck); got != "71%3Aabc%3A9" {
+		t.Errorf("cookie sessionid: got %q", got)
+	}
+	if !hasSession(&config{sessionFile: ck}) {
+		t.Errorf("hasSession should be true for a cookie sessionid")
+	}
+	// an empty/missing file: no session
+	if hasSession(&config{sessionFile: filepath.Join(dir, "nope.txt")}) {
+		t.Errorf("hasSession should be false when the file is missing")
+	}
+}
+
 func TestRunResolveWritesInPlace(t *testing.T) {
 	srv := fakeProfileInfo(t)
 	old := resolveURL

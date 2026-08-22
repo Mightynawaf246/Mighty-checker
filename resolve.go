@@ -69,7 +69,14 @@ func loadSession(path string) string {
 	}
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
-		if line == "" {
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		// A mobile Bearer token is not a cookie sessionid - skip it so a
+		// token-only file does not get its whole line mistaken for a sessionid.
+		low := strings.ToLower(line)
+		if strings.HasPrefix(low, "authorization:") ||
+			strings.HasPrefix(line, "Bearer ") || strings.HasPrefix(line, "IGT:") {
 			continue
 		}
 		if i := strings.Index(line, "sessionid="); i >= 0 {
@@ -82,6 +89,13 @@ func loadSession(path string) string {
 		return line // bare sessionid
 	}
 	return ""
+}
+
+// hasSession reports whether the session file yields any usable credential -
+// a mobile Bearer token or a sessionid cookie. The plain run uses this to
+// decide between the automatic watch-by-id pipeline and the availability check.
+func hasSession(cfg *config) bool {
+	return loadAuthToken(cfg.sessionFile) != "" || loadSession(cfg.sessionFile) != ""
 }
 
 // loadAuthToken reads a mobile Bearer token from the session file. It accepts a

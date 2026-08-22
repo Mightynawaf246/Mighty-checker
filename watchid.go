@@ -235,8 +235,9 @@ func runWatchIDs(ctx context.Context, cfg *config, pool *proxyPool, cache *clien
 		targets = append(targets, watchTarget{id: id, username: name})
 	}
 	if len(targets) == 0 {
-		fatalf("no \"username:id\" targets in %s - run with -resolve-first (or -resolve-ids) "+
-			"to fill the ids first, then watch", cfg.usernamesFile)
+		fatalf("nothing to watch: no \"username:id\" pairs in %s. The ids could not be "+
+			"filled - usually the session token is missing/expired, or the names do not "+
+			"exist. Check %s and try again", cfg.usernamesFile, cfg.sessionFile)
 	}
 
 	interval := cfg.watchInterval
