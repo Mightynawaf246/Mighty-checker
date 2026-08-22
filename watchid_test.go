@@ -66,7 +66,7 @@ func TestRunWatchIDsFiresOnRename(t *testing.T) {
 	cfg := &config{
 		threads: 2, timeout: 5 * time.Second, retries: 1,
 		usernamesFile: uf, sessionFile: sess,
-		watchIDs: true, watchConfirm: false, watchInterval: time.Second,
+		watchIDs: true, watchConfirm: false, watchOnce: true, watchInterval: time.Second,
 		onAvailable: fmt.Sprintf(`printf '%%s' "$1" > %s`, sentinel),
 	}
 
@@ -79,5 +79,49 @@ func TestRunWatchIDsFiresOnRename(t *testing.T) {
 	}
 	if strings.TrimSpace(string(got)) != "oldhandle" {
 		t.Errorf("hook fired with wrong handle: %q", got)
+	}
+}
+
+// The default watch keeps running until the user stops it: even after every
+// target has freed, it must not exit on its own - only ctx cancel ends it.
+func TestRunWatchIDsRunsUntilStopped(t *testing.T) {
+	srv := fakeUserInfo(t)
+	old := userInfoURL
+	userInfoURL = srv.URL + "/api/v1/users/%s/info/"
+	t.Cleanup(func() { userInfoURL = old })
+
+	dir := t.TempDir()
+	uf := filepath.Join(dir, "usernames.txt")
+	os.WriteFile(uf, []byte("oldhandle:111\n"), 0o644) // renames -> frees at once
+	sess := filepath.Join(dir, "session.txt")
+	os.WriteFile(sess, []byte("Bearer IGT:2:fake\n"), 0o600)
+
+	cfg := &config{
+		threads: 2, timeout: 5 * time.Second, retries: 1,
+		usernamesFile: uf, sessionFile: sess,
+		watchIDs: true, watchConfirm: false, watchOnce: false, // persistent
+		watchInterval: 100 * time.Millisecond,
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		runWatchIDs(ctx, cfg, newProxyPool(nil),
+			newClientCacheFor(cfg.timeout, cfg.threads, 0), newAdaptiveLimiter(cfg.threads, true))
+		close(done)
+	}()
+
+	// the one target frees on the first round, then it must keep idling
+	select {
+	case <-done:
+		t.Fatal("watch exited on its own; it must run until stopped")
+	case <-time.After(400 * time.Millisecond):
+	}
+
+	cancel() // this is the user's Ctrl-C
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("watch did not stop after the context was cancelled")
 	}
 }

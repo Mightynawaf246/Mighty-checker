@@ -62,6 +62,7 @@ type config struct {
 	watchIDs         bool
 	watchInterval    time.Duration
 	watchConfirm     bool
+	watchOnce        bool
 	checkOnly        bool
 }
 
@@ -2108,6 +2109,8 @@ func parseFlags() *config {
 		"how often to re-check each watched account in -watch-ids")
 	flag.BoolVar(&cfg.watchConfirm, "watch-confirm", true,
 		"in -watch-ids, confirm a freed handle is actually available before firing the claimer")
+	flag.BoolVar(&cfg.watchOnce, "watch-once", false,
+		"exit the watch as soon as every target has freed; default is to keep running until you stop it (Ctrl-C)")
 	flag.BoolVar(&cfg.checkOnly, "check-only", false,
 		"force a plain availability check even when a session is present (skips the automatic watch-by-id)")
 
@@ -2151,6 +2154,8 @@ options:
   -watch-ids            watch username:id targets; fire the claimer the moment a
                         target renames and frees its handle
   -watch-interval D     how often to re-check each watched account (default 15s)
+  -watch-once           stop the watch when every target has freed (default: keep
+                        running until you stop it with Ctrl-C)
   -check-only           force a plain availability check even with a session set
   -session-file FILE    session for the auto watch / -resolve-ids (default session.txt)
 

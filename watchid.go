@@ -253,25 +253,26 @@ func runWatchIDs(ctx context.Context, cfg *config, pool *proxyPool, cache *clien
 	hook := newHookRunner(cfg.onAvailable, con)
 	defer hook.stop()
 
-	// remaining is the set still being watched; a target leaves once its handle
+	// active is the set still being watched; a target leaves it once its handle
 	// frees (and fires) so the claimer is never asked twice for the same one.
-	remaining := targets
-	round := 0
-	for len(remaining) > 0 {
+	// By default the watch NEVER stops on its own - it keeps running until the
+	// user stops it with Ctrl-C, even after every target has freed. -watch-once
+	// asks it to exit as soon as there is nothing left to watch.
+	active := targets
+	fired := 0
+	announcedIdle := false
+	for {
 		if ctx.Err() != nil {
 			break
 		}
-		round++
+
 		var still []watchTarget
+		var freed int
 		var mu sync.Mutex
 
 		var wg sync.WaitGroup
 		sem := make(chan struct{}, max2(cfg.threads, 1))
-		for _, tg := range remaining {
-			select {
-			case <-ctx.Done():
-			default:
-			}
+		for _, tg := range active {
 			if ctx.Err() != nil {
 				break
 			}
@@ -291,6 +292,9 @@ func runWatchIDs(ctx context.Context, cfg *config, pool *proxyPool, cache *clien
 				case gone:
 					con.log(cYellow(fmt.Sprintf("  * @%s: account %s is gone - handle may be free", tg.username, tg.id)))
 					handleFreed(ctx, tg, "account gone", pool, cache, cfg, lim, hook, con)
+					mu.Lock()
+					freed++
+					mu.Unlock()
 				case strings.EqualFold(cur, tg.username):
 					// still held by the same account; keep watching
 					mu.Lock()
@@ -299,15 +303,29 @@ func runWatchIDs(ctx context.Context, cfg *config, pool *proxyPool, cache *clien
 				default:
 					con.log(cGreen(fmt.Sprintf("  + @%s FREED (account %s renamed to @%s)", tg.username, tg.id, cur)))
 					handleFreed(ctx, tg, "renamed to @"+cur, pool, cache, cfg, lim, hook, con)
+					mu.Lock()
+					freed++
+					mu.Unlock()
 				}
 			}(tg)
 		}
 		wg.Wait()
 
-		remaining = still
-		if len(remaining) == 0 {
-			break
+		active = still
+		fired += freed
+
+		if len(active) == 0 {
+			if cfg.watchOnce {
+				break
+			}
+			// Persistent mode: nothing left to watch, but do NOT exit - keep
+			// running until the user stops it. Say so once, then idle.
+			if !announcedIdle {
+				con.log(cGray(fmt.Sprintf("  all targets handled (%d claimed). still running - press Ctrl-C to stop.", fired)))
+				announcedIdle = true
+			}
 		}
+
 		// wait out the interval, but wake immediately on Ctrl-C
 		select {
 		case <-time.After(interval):
@@ -315,7 +333,7 @@ func runWatchIDs(ctx context.Context, cfg *config, pool *proxyPool, cache *clien
 		}
 	}
 
-	fmt.Printf("\n[+] watch finished: %d target(s) still held / unresolved\n", len(remaining))
+	fmt.Printf("\n[+] watch stopped: %d claimed, %d still held\n", fired, len(active))
 }
 
 // handleFreed confirms a freed handle is actually claimable (unless confirm is
