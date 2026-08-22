@@ -2108,7 +2108,7 @@ func parseFlags() *config {
 	flag.DurationVar(&cfg.watchInterval, "watch-interval", 15*time.Second,
 		"how often to re-check each watched account in -watch-ids")
 	flag.BoolVar(&cfg.watchConfirm, "watch-confirm", true,
-		"in -watch-ids, confirm a freed handle is actually available before firing the claimer")
+		"in -watch-ids with NO claimer set, confirm a freed handle before logging it; with a claimer the claim fires instantly regardless")
 	flag.BoolVar(&cfg.watchOnce, "watch-once", false,
 		"exit the watch as soon as every target has freed; default is to keep running until you stop it (Ctrl-C)")
 	flag.BoolVar(&cfg.checkOnly, "check-only", false,

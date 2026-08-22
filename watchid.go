@@ -336,28 +336,31 @@ func runWatchIDs(ctx context.Context, cfg *config, pool *proxyPool, cache *clien
 	fmt.Printf("\n[+] watch stopped: %d claimed, %d still held\n", fired, len(active))
 }
 
-// handleFreed confirms a freed handle is actually claimable (unless confirm is
-// off) and then fires the claimer/hook once.
+// handleFreed acts on a handle the instant it frees. When a claimer is set it
+// fires IMMEDIATELY - no confirmation round trip in the critical path, because
+// the claimer's own request is the real test and every millisecond is the race.
+// The availability confirm is only used, for logging, when there is no claimer.
 func handleFreed(ctx context.Context, tg watchTarget, why string, pool *proxyPool, cache *clientCache,
 	cfg *config, lim *adaptiveLimiter, hook *hookRunner, con *console) {
 
+	if hook != nil {
+		hook.fire(ctx, tg.username) // instant - do not block the claim on anything
+		return
+	}
+	// No claimer to fire: optionally confirm just so the log is accurate.
 	if cfg.watchConfirm {
 		ok, err := confirmAvailable(ctx, tg.username, pool, cache, cfg, lim)
 		switch {
 		case err != nil:
-			con.log(cGray(fmt.Sprintf("      @%s: could not confirm (%v) - firing anyway on the id signal", tg.username, err)))
-		case !ok:
-			con.log(cYellow(fmt.Sprintf("      @%s: freed but already re-taken - not firing", tg.username)))
-			return
+			con.log(cGray(fmt.Sprintf("      @%s: freed (%s) - could not confirm (%v)", tg.username, why, err)))
+		case ok:
+			con.log(cGreen(fmt.Sprintf("  ! @%s is FREE (%s) - confirmed available, no -on-available set", tg.username, why)))
 		default:
-			con.log(cGreen(fmt.Sprintf("      @%s: confirmed available", tg.username)))
+			con.log(cYellow(fmt.Sprintf("      @%s: freed (%s) but already re-taken", tg.username, why)))
 		}
+		return
 	}
-	if hook != nil {
-		hook.fire(ctx, tg.username)
-	} else {
-		con.log(cGreen(fmt.Sprintf("  ! @%s is FREE (%s) - no -on-available set, nothing fired", tg.username, why)))
-	}
+	con.log(cGreen(fmt.Sprintf("  ! @%s is FREE (%s) - no -on-available set, nothing fired", tg.username, why)))
 }
 
 func max2(a, b int) int {
