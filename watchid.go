@@ -272,7 +272,7 @@ func runWatchIDs(ctx context.Context, cfg *config, pool *proxyPool, cache *clien
 			fatalf("claimer: no accounts warmed (sessions missing/expired in %s)", cfg.sessionsFile)
 		}
 		hook = newActionRunner(func(ctx context.Context, name string) (string, error) {
-			return cl.claim(ctx, name, pool, cache, lim)
+			return cl.claim(ctx, name, pool, cache, lim, false)
 		}, con)
 	} else {
 		hook = newHookRunner(cfg.onAvailable, con)

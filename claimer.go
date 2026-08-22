@@ -22,6 +22,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"net/http"
@@ -66,6 +67,34 @@ type claimer struct {
 	stateFile string
 
 	mu sync.Mutex // guards inUse/used across accounts and the state file
+}
+
+// runClaimHook is the single-shot "-claim-hook" mode: a drop-in replacement for
+// the old external claim.py. The checker fires it once per freed handle via
+// -on-available "mighty -claim-hook", passing the name in MIGHTY_USERNAME. It
+// warms the account it picks, claims the handle, and exits. Same claimer code as
+// the resident -claim path, so there is ONE claimer, not two.
+func runClaimHook(ctx context.Context, cfg *config, pool *proxyPool, cache *clientCache, lim *adaptiveLimiter) {
+	name := strings.ToLower(strings.TrimSpace(os.Getenv("MIGHTY_USERNAME")))
+	if name == "" {
+		if a := flag.Arg(0); a != "" {
+			name = strings.ToLower(strings.TrimSpace(a))
+		}
+	}
+	con := newConsole(cfg)
+	if name == "" {
+		fatalf("claim-hook: no username (set MIGHTY_USERNAME or pass one as an argument)")
+	}
+	cl, err := newClaimer(cfg.sessionsFile, cfg.outDir, cfg.claimLive, con)
+	if err != nil {
+		fatalf("claim-hook: %v", err)
+	}
+	msg, err := cl.claim(ctx, name, pool, cache, lim, true)
+	if err != nil {
+		con.log(cRed("  ! claim @" + name + " failed: " + err.Error()))
+		os.Exit(1)
+	}
+	con.log(cGreen("  ! " + msg))
 }
 
 // dsUserID pulls the account id out of a sessionid ("<id>%3A..." or "<id>:...").
@@ -261,12 +290,15 @@ func (c *claimer) warmAll(ctx context.Context, pool *proxyPool, cache *clientCac
 	return ready
 }
 
-// takeAccount picks a warm, unburned, not-in-use account and marks it in use.
-func (c *claimer) takeAccount(exclude map[string]bool) *claimAccount {
+// takeAccount picks an unburned, not-in-use account and marks it in use.
+// requireWarm restricts it to already-warm accounts (the resident path); when
+// false it may hand back a cold account for the caller to warm on demand (the
+// single-shot hook path).
+func (c *claimer) takeAccount(exclude map[string]bool, requireWarm bool) *claimAccount {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	for _, a := range c.accounts {
-		if a.warmed && !a.used && !a.inUse && !exclude[a.acct] {
+		if (!requireWarm || a.warmed) && !a.used && !a.inUse && !exclude[a.acct] {
 			a.inUse = true
 			return a
 		}
@@ -337,16 +369,40 @@ func (c *claimer) tryRename(ctx context.Context, client *http.Client, a *claimAc
 	return false, msg, retryable
 }
 
-// claim is the action handed to the watcher: take a handle with a warm account.
-// It fits hookRunner.action - returns a line to log plus an error.
-func (c *claimer) claim(ctx context.Context, name string, pool *proxyPool, cache *clientCache, lim *adaptiveLimiter) (string, error) {
+// claim is the action handed to the watcher: take a handle with an account.
+// warmOnDemand=false is the resident path (accounts pre-warmed, fires a single
+// POST); warmOnDemand=true is the single-shot hook path (warms the account it
+// picks first, like claim.py). It fits hookRunner.action - returns a line to
+// log plus an error.
+func (c *claimer) claim(ctx context.Context, name string, pool *proxyPool, cache *clientCache, lim *adaptiveLimiter, warmOnDemand bool) (string, error) {
 	tried := map[string]bool{}
 	for {
-		a := c.takeAccount(tried)
+		a := c.takeAccount(tried, !warmOnDemand)
 		if a == nil {
-			return "", fmt.Errorf("@%s: no warm account available", name)
+			return "", fmt.Errorf("@%s: no account available", name)
 		}
 		tried[a.acct] = true
+
+		client, err := cache.clientFor(pool.next())
+		if err != nil {
+			c.release(a)
+			continue
+		}
+		// Single-shot: warm this account now (validates the session, caches the
+		// form + fresh csrftoken). Resident accounts are already warm.
+		if warmOnDemand && !a.warmed {
+			if !lim.acquire(ctx) {
+				c.release(a)
+				return "", ctx.Err()
+			}
+			werr := c.warm(ctx, client, a)
+			lim.release()
+			if werr != nil {
+				c.con.log(cGray("      claimer: " + werr.Error()))
+				c.release(a)
+				continue
+			}
+		}
 
 		if !c.live {
 			c.saveCaught(name, a)
@@ -354,11 +410,6 @@ func (c *claimer) claim(ctx context.Context, name string, pool *proxyPool, cache
 			return fmt.Sprintf("[dry-run] would take @%s with acct %s (was @%s); cookies saved", name, a.acct, a.username), nil
 		}
 
-		client, err := cache.clientFor(pool.next())
-		if err != nil {
-			c.release(a)
-			continue
-		}
 		delay := claimRetryBase
 		for attempt := 1; attempt <= claimRetries+1; attempt++ {
 			if !lim.acquire(ctx) {

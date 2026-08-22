@@ -65,6 +65,7 @@ type config struct {
 	watchOnce        bool
 	checkOnly        bool
 	builtinClaimer   bool
+	claimHook        bool
 	claimLive        bool
 	sessionsFile     string
 }
@@ -416,7 +417,7 @@ func main() {
 	// Testing proxies needs no usernames, so do not demand a list for it. This
 	// is the one command someone runs before their list is ready.
 	var usernames []string
-	if !cfg.checkProxiesOnly && !cfg.selfTestOnly {
+	if !cfg.checkProxiesOnly && !cfg.selfTestOnly && !cfg.claimHook {
 		var err error
 		usernames, err = loadLines(cfg.usernamesFile)
 		if err != nil {
@@ -559,6 +560,14 @@ func main() {
 
 	// Resolver mode: a different job from availability - turn each username
 	// into its numeric id. It reuses the same engine and returns early.
+	// Single-shot claimer hook: claim the handle in MIGHTY_USERNAME and exit.
+	// The drop-in replacement for the external claim.py, sharing the same
+	// claimer code as -claim.
+	if cfg.claimHook {
+		runClaimHook(ctx, cfg, pool, cache, lim)
+		return
+	}
+
 	if cfg.resolveIDs {
 		runResolve(ctx, cfg, usernames, pool, cache, lim)
 		return
@@ -2118,6 +2127,8 @@ func parseFlags() *config {
 		"force a plain availability check even when a session is present (skips the automatic watch-by-id)")
 	flag.BoolVar(&cfg.builtinClaimer, "claim", false,
 		"use the built-in pre-warmed Go claimer as the action on a free (accounts from -sessions-file); fastest path, a single POST per hit")
+	flag.BoolVar(&cfg.claimHook, "claim-hook", false,
+		"single-shot claimer for -on-available: claim the handle in MIGHTY_USERNAME and exit (drop-in replacement for claim.py, same claimer code as -claim)")
 	flag.BoolVar(&cfg.claimLive, "claim-live", false,
 		"with -claim, actually perform the rename; default is a dry run that warms and rehearses but changes nothing")
 	flag.StringVar(&cfg.sessionsFile, "sessions-file", "sessions.txt",
@@ -2167,7 +2178,9 @@ options:
                         running until you stop it with Ctrl-C)
   -claim                use the built-in pre-warmed Go claimer on a free (fastest:
                         accounts logged in up front, a single POST per hit)
-  -claim-live           with -claim, actually rename (default is a dry run)
+  -claim-hook           single-shot claimer for -on-available (drop-in for
+                        claim.py): claims MIGHTY_USERNAME and exits
+  -claim-live           with -claim / -claim-hook, actually rename (default: dry run)
   -sessions-file FILE   accounts for the built-in claimer (default sessions.txt)
   -check-only           force a plain availability check even with a session set
   -session-file FILE    session for the auto watch / -resolve-ids (default session.txt)

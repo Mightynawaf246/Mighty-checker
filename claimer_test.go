@@ -57,7 +57,7 @@ func TestClaimerWarmAndClaim(t *testing.T) {
 	}
 
 	// claim a free handle -> success, one account burned, caught file written
-	msg, err := cl.claim(context.Background(), "free_now", pool, cache, lim)
+	msg, err := cl.claim(context.Background(), "free_now", pool, cache, lim, false)
 	if err != nil || !strings.Contains(msg, "free_now") {
 		t.Fatalf("claim failed: msg=%q err=%v", msg, err)
 	}
@@ -78,6 +78,34 @@ func TestClaimerWarmAndClaim(t *testing.T) {
 	}
 }
 
+// The single-shot hook path warms the account it picks on demand (no warmAll)
+// and still claims - one claimer, two invocation styles.
+func TestClaimerSingleShotWarmsOnDemand(t *testing.T) {
+	srv := fakeEdit(t)
+	old := editURL
+	editURL = srv.URL
+	t.Cleanup(func() { editURL = old })
+
+	dir := t.TempDir()
+	sess := filepath.Join(dir, "sessions.txt")
+	os.WriteFile(sess, []byte("111%3Aabc%3A9\n"), 0o600)
+
+	con := newConsole(&config{})
+	cl, _ := newClaimer(sess, dir, true /*live*/, con)
+	pool := newProxyPool(nil)
+	cache := newClientCacheFor(5*time.Second, 4, 0)
+	lim := newAdaptiveLimiter(4, true)
+
+	// no warmAll here - claim(warmOnDemand=true) must warm the account itself
+	msg, err := cl.claim(context.Background(), "free_now", pool, cache, lim, true)
+	if err != nil || !strings.Contains(msg, "free_now") {
+		t.Fatalf("single-shot claim failed: msg=%q err=%v", msg, err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "caught", "free_now.txt")); err != nil {
+		t.Errorf("caught file not written by single-shot: %v", err)
+	}
+}
+
 func TestClaimerDryRunChangesNothing(t *testing.T) {
 	srv := fakeEdit(t)
 	old := editURL
@@ -95,7 +123,7 @@ func TestClaimerDryRunChangesNothing(t *testing.T) {
 	lim := newAdaptiveLimiter(4, true)
 	cl.warmAll(context.Background(), pool, cache, lim)
 
-	msg, err := cl.claim(context.Background(), "anything", pool, cache, lim)
+	msg, err := cl.claim(context.Background(), "anything", pool, cache, lim, false)
 	if err != nil || !strings.Contains(msg, "dry-run") {
 		t.Fatalf("dry-run claim: msg=%q err=%v", msg, err)
 	}
