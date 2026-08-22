@@ -64,6 +64,9 @@ type config struct {
 	watchConfirm     bool
 	watchOnce        bool
 	checkOnly        bool
+	builtinClaimer   bool
+	claimLive        bool
+	sessionsFile     string
 }
 
 // liveStats holds counters written by workers and read by the status line, so
@@ -2113,6 +2116,12 @@ func parseFlags() *config {
 		"exit the watch as soon as every target has freed; default is to keep running until you stop it (Ctrl-C)")
 	flag.BoolVar(&cfg.checkOnly, "check-only", false,
 		"force a plain availability check even when a session is present (skips the automatic watch-by-id)")
+	flag.BoolVar(&cfg.builtinClaimer, "claim", false,
+		"use the built-in pre-warmed Go claimer as the action on a free (accounts from -sessions-file); fastest path, a single POST per hit")
+	flag.BoolVar(&cfg.claimLive, "claim-live", false,
+		"with -claim, actually perform the rename; default is a dry run that warms and rehearses but changes nothing")
+	flag.StringVar(&cfg.sessionsFile, "sessions-file", "sessions.txt",
+		"accounts for the built-in claimer: one sessionid or full cookie line each; never printed")
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, `Mighty - Instagram username availability checker
@@ -2156,6 +2165,10 @@ options:
   -watch-interval D     how often to re-check each watched account (default 15s)
   -watch-once           stop the watch when every target has freed (default: keep
                         running until you stop it with Ctrl-C)
+  -claim                use the built-in pre-warmed Go claimer on a free (fastest:
+                        accounts logged in up front, a single POST per hit)
+  -claim-live           with -claim, actually rename (default is a dry run)
+  -sessions-file FILE   accounts for the built-in claimer (default sessions.txt)
   -check-only           force a plain availability check even with a session set
   -session-file FILE    session for the auto watch / -resolve-ids (default session.txt)
 

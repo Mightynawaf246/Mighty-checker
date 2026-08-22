@@ -250,7 +250,31 @@ func runWatchIDs(ctx context.Context, cfg *config, pool *proxyPool, cache *clien
 		warnf("%d name(s) had no id and were skipped - resolve them first to watch", skipped)
 	}
 
-	hook := newHookRunner(cfg.onAvailable, con)
+	// Wire the action fired on a free: either the built-in pre-warmed Go
+	// claimer (fastest - a single POST, accounts logged in up front) or an
+	// external -on-available command.
+	var hook *hookRunner
+	if cfg.builtinClaimer {
+		cl, err := newClaimer(cfg.sessionsFile, cfg.outDir, cfg.claimLive, con)
+		if err != nil {
+			fatalf("claimer: %v", err)
+		}
+		ready := cl.warmAll(ctx, pool, cache, lim)
+		mode := "DRY RUN (nothing will change)"
+		if cfg.claimLive {
+			mode = "LIVE"
+		}
+		fmt.Println(" " + label("Claimer") + " " + cGray(fmt.Sprintf(
+			"%d/%d accounts warm and ready - %s", ready, len(cl.accounts), mode)))
+		if ready == 0 {
+			fatalf("claimer: no accounts warmed (sessions missing/expired in %s)", cfg.sessionsFile)
+		}
+		hook = newActionRunner(func(ctx context.Context, name string) (string, error) {
+			return cl.claim(ctx, name, pool, cache, lim)
+		}, con)
+	} else {
+		hook = newHookRunner(cfg.onAvailable, con)
+	}
 	defer hook.stop()
 
 	// active is the set still being watched; a target leaves it once its handle
