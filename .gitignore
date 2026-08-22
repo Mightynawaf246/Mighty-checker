@@ -21,5 +21,14 @@ errors.txt
 username.txt
 proxies.txt
 
+# Credentials and claimer state. NEVER commit these - they are full accounts
+# and live tokens in plain text. Copy from the .example templates and fill in.
+session.txt
+sessions.txt
+claimed.json
+claim.log
+caught/
+ids.txt
+
 # Test binaries from -cpuprofile runs
 *.test

@@ -1,0 +1,15 @@
+# session.example.txt  ->  copy to  session.txt  and put ONE line in it.
+#
+# This is the READ session used to pull ids and watch accounts by id
+# (resolve / watch modes). Use a MOBILE Bearer token captured from the
+# Instagram Android app (HTTP Toolkit). A throwaway account is recommended.
+#
+# Paste the token in ANY of these shapes (all accepted):
+#   authorization: Bearer IGT:2:XXXXXXXXXXXXXXXXX
+#   Bearer IGT:2:XXXXXXXXXXXXXXXXX
+#   IGT:2:XXXXXXXXXXXXXXXXX
+#
+# A plain sessionid also works but is blocked far sooner than the token:
+#   sessionid=XXXXXXXXXXXXXXXXX
+#
+# NEVER commit session.txt - it is a live login. The tool never prints it.

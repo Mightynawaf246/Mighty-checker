@@ -1,0 +1,12 @@
+# sessions.example.txt  ->  copy to  sessions.txt
+#
+# These are the CLAIMER accounts - the ones that will TAKE a freed handle.
+# One account per line. Each account takes at most one handle, then is burned.
+# Use throwaway accounts.
+#
+# One sessionid per line, or a full cookie line:
+#   12345678%3AAbCdEf%3A9
+#   mid=...; ig_did=...; csrftoken=...; ds_user_id=12345678; sessionid=12345678%3AAbCdEf%3A9
+#
+# NEVER commit sessions.txt or the caught/ folder - they are full accounts in
+# plain text. On Linux: chmod 600 sessions.txt. The tool never prints them.

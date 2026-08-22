@@ -33,6 +33,56 @@ external dependencies** — standard library only.
 - **Self-update** — the tool updates itself; no need to re-download source.
 - **Webhook** — optional notification when an available username is found.
 
+## Catching handles: resolve, watch, claim
+
+Beyond the availability check, `mighty` is one binary that also resolves ids,
+watches target accounts, and claims freed handles. No Python, no separate
+claimer — all of it is flags on `mighty`.
+
+Put your files next to the binary (copy the `.example` templates):
+
+| file | what it holds |
+|---|---|
+| `username.txt` | the target accounts whose handles you want (one per line) |
+| `session.txt` | a **mobile Bearer token** for reading/watching — see `session.example.txt` |
+| `sessions.txt` | the **claimer accounts** that take a handle — see `sessions.example.txt` |
+| `proxies.txt` | optional |
+
+**A plain run auto-detects a session and does the whole flow:**
+
+```bash
+# fill missing ids -> watch the accounts by id -> claim the instant a handle
+# frees. Dry run (rehearses, changes nothing) until you add -claim-live:
+mighty -u username.txt -claim -sessions-file sessions.txt
+
+# go live (actually rename):
+mighty -u username.txt -claim -claim-live -sessions-file sessions.txt
+```
+
+On Windows just double-click **`catch.bat`**; on Linux run **`./catch.sh`**.
+
+The pieces, if you want them separately:
+
+```bash
+mighty -u username.txt -resolve-ids        # username -> username:id, in place
+mighty -u username.txt -resolve-first       # fill missing ids, then start the check
+mighty -u username.txt -watch-ids           # watch username:id targets, fire on release
+mighty -u username.txt -check-only          # plain available/taken check, even with a session
+mighty -claim-hook                          # single-shot claimer for -on-available (claim.py replacement)
+```
+
+How the watch is precise: an account's numeric **id never changes but its
+username does**, so watching the id catches the exact moment a target renames
+and frees its handle — then the pre-warmed claimer fires a single POST. The
+watch keeps running until you stop it (Ctrl-C); `-watch-once` exits when every
+target has freed.
+
+**Security.** `session.txt`, `sessions.txt`, and `caught/*.txt` are live
+tokens and full accounts in plain text. They are git-ignored — never commit
+them; on Linux `chmod 600` them. Automating writes on Instagram breaks its
+terms and is detected far harder than the read-only checker. Use throwaway
+accounts; the risk is yours.
+
 ## Install
 
 ```bash
